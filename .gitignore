@@ -1,0 +1,4 @@
+.DS_Store
+veggie_classification/data/
+veggie_classification/train/classification_V1/runs/
+veggie_classification/train/classification_V1/yolo_dataset/
