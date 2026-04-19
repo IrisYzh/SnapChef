@@ -2,7 +2,7 @@
 #define LABELS_H
 
 const int NUM_CLASSES = 10;
-const float CONFIDENCE_THRESHOLD = 0.9f;
+const float CONFIDENCE_THRESHOLD = 0.8f;
 const char* UNKNOWN_LABEL = "Object not known";
 
 const char* LABELS[] = {
