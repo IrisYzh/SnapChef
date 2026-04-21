@@ -15,7 +15,7 @@ SnapChef/
 │   │   ├── esp32_deploy_V0/         # Custom Tiny CNN (TFLite Micro, 23 KB)
 │   │   ├── esp32_deploy_V1/         # YOLOv8n-cls (TFLite Micro, 1.5 MB)
 │   │   ├── esp32_deploy_V2/         # Grove Vision AI V2 via SSCMA  ← current
-│   │   └── esp32_deploy_V3/         # Edge Impulse library
+│   │   └── esp32_deploy_V3/         # MobileNet V2 (Edge Impulse library)
 │   └── train/
 │       ├── download_dataset.ipynb   # Kaggle dataset download
 │       ├── classification_V0/       # Custom CNN training + TFLite export

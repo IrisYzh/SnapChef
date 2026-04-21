@@ -1,21 +1,23 @@
 /*
  * Vegetable Classification on XIAO ESP32S3 Sense + OV3660
  *
- * Uses OV3660 camera + TFLite Micro + YOLOv8n-cls (INT8) to classify
- * 10 vegetables. Outputs "Object not known" when confidence is below
+ * Uses OV3660 camera + TFLite Micro + MobileNetV2 (alpha=0.35, INT8) to
+ * classify 10 vegetables. Outputs "Object not known" when confidence is below
  * threshold. Includes WiFi web server to preview camera images.
  *
  * Hardware:
  *   - Seeed Studio XIAO ESP32S3 Sense (the Sense expansion with camera FFC)
  *   - OV3660 camera module (3MP) plugged into the FFC connector
  *
- * Model: YOLOv8n-cls @ 96x96, INT8 quantized, tensor arena in PSRAM.
+ * Model: MobileNetV2 (alpha=0.35) @ 96x96, INT8 quantized, tensor arena in
+ * PSRAM. `preprocess_input` ((x/127.5)-1) is baked into the graph, so the
+ * firmware feeds raw [0,255] pixels quantized by the model's own input scale.
  *
  * Arduino IDE setup:
  *   1. Board package: esp32 by Espressif, v3.x
  *   2. Board: "XIAO_ESP32S3"
  *   3. PSRAM: "OPI PSRAM"  (REQUIRED — arena lives in PSRAM)
- *   4. Partition scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"  (model is ~1.5MB)
+ *   4. Partition scheme: "Huge APP (3MB No OTA/1MB SPIFFS)"  (model is ~625 KB)
  *   5. Library: "TensorFlowLite_ESP32" from Library Manager
  *   6. Update WIFI_SSID / WIFI_PASS below
  */
@@ -61,8 +63,9 @@ constexpr int kImageWidth    = 96;
 constexpr int kImageHeight   = 96;
 constexpr int kImageChannels = 3;
 
-// YOLOv8n-cls @ 96x96 INT8 needs ~500KB–1MB of arena — must live in PSRAM.
-constexpr int kTensorArenaSize = 1024 * 1024;   // 1 MB
+// MobileNetV2-0.35 @ 96x96 INT8 needs ~200-300 KB of arena. 512 KB gives
+// headroom for the baked preprocess ops + persistent input/output tensors.
+constexpr int kTensorArenaSize = 512 * 1024;
 uint8_t* tensor_arena = nullptr;
 
 constexpr unsigned long kInferenceIntervalMs = 2000;
@@ -130,7 +133,6 @@ bool initCamera() {
     return false;
   }
 
-  // Log which sensor was detected so we can confirm OV3660 is really there.
   sensor_t* s = esp_camera_sensor_get();
   if (!s) {
     Serial.println("esp_camera_sensor_get() returned null");
@@ -142,12 +144,9 @@ bool initCamera() {
     Serial.println("WARNING: sensor is not OV3660. Code will still work but "
                    "color/brightness tweaks may need adjusting.");
   } else {
-    // OV3660 defaults are a bit dark and oversaturated — nudge them.
     s->set_brightness(s, 1);
     s->set_saturation(s, -1);
     s->set_contrast(s, 0);
-    // OV3660 image is mirrored on XIAO Sense FFC orientation; flip vertically
-    // so the preview + model input matches what the user sees.
     s->set_vflip(s, 1);
     s->set_hmirror(s, 0);
   }
@@ -159,15 +158,10 @@ bool initCamera() {
 // buffer, center-crop to square, nearest-neighbor downsample to 96x96, and
 // quantize into the model's INT8 input tensor.
 //
-// No pixformat switching — camera stays in JPEG mode permanently. Web
-// preview and inference both consume JPEG frames from the same stream.
-//
-// ultralytics' best_full_integer_quant.tflite uses input_scale ≈ 1/255 and
-// zero_point = -128, meaning the quant formula expects a *normalized* [0,1]
-// float, not raw 0..255. So we divide by 255 first:
-//     int8 = round((pixel_u8 / 255.0) / input_scale + input_zero_point)
-//
-// Returns true on success, false if the frame should be skipped.
+// MobileNetV2 here has `preprocess_input` ((x/127.5)-1) baked into the graph,
+// so the model's float input range is raw [0, 255] — NOT the [0, 1] that YOLO
+// expected. Quant formula: int8 = round(pixel_u8 / input_scale + zp).
+// (Expect input_scale ≈ 1.0, zp ≈ -128.)
 bool captureAndPreprocess(int8_t* input_data) {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) {
@@ -180,7 +174,6 @@ bool captureAndPreprocess(int8_t* input_data) {
     return false;
   }
 
-  // Decode JPEG → RGB888 directly into the persistent PSRAM buffer.
   if (!fmt2rgb888(fb->buf, fb->len, fb->format, rgb888_buf)) {
     Serial.println("JPEG decode failed");
     esp_camera_fb_return(fb);
@@ -190,11 +183,10 @@ bool captureAndPreprocess(int8_t* input_data) {
   const int src_h = fb->height;
   esp_camera_fb_return(fb);
 
-  // Center-crop to a square, then nearest-neighbor resize to 96x96.
   const int crop   = src_w < src_h ? src_w : src_h;
   const int x_off  = (src_w - crop) / 2;
   const int y_off  = (src_h - crop) / 2;
-  const float inv255_scale = 1.0f / (255.0f * input_scale);
+  const float inv_input_scale = 1.0f / input_scale;
 
   for (int y = 0; y < kImageHeight; y++) {
     const int sy = y_off + (y * crop) / kImageHeight;
@@ -206,9 +198,9 @@ bool captureAndPreprocess(int8_t* input_data) {
       const uint8_t b = rgb888_buf[pi + 2];
 
       const int idx = (y * kImageWidth + x) * kImageChannels;
-      input_data[idx + 0] = (int8_t)lroundf((float)r * inv255_scale + input_zero_point);
-      input_data[idx + 1] = (int8_t)lroundf((float)g * inv255_scale + input_zero_point);
-      input_data[idx + 2] = (int8_t)lroundf((float)b * inv255_scale + input_zero_point);
+      input_data[idx + 0] = (int8_t)lroundf((float)r * inv_input_scale + input_zero_point);
+      input_data[idx + 1] = (int8_t)lroundf((float)g * inv_input_scale + input_zero_point);
+      input_data[idx + 2] = (int8_t)lroundf((float)b * inv_input_scale + input_zero_point);
     }
   }
   return true;
@@ -223,7 +215,7 @@ void handleRoot() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Veggie Classifier (YOLOv8 + OV3660)</title>
+  <title>Veggie Classifier (MobileNetV2 + OV3660)</title>
   <style>
     body { font-family: Arial, sans-serif; text-align: center; background: #1a1a2e; color: #eee; margin: 0; padding: 20px; }
     h1 { color: #4ecca3; }
@@ -238,7 +230,7 @@ void handleRoot() {
   <h1>Vegetable Classifier</h1>
   <div><img id="cam" src="/capture" /></div>
   <div id="result" class="result known">Loading...</div>
-  <p class="info">XIAO ESP32S3 Sense + OV3660 | YOLOv8n-cls 96x96 INT8 | auto-refresh 2s</p>
+  <p class="info">XIAO ESP32S3 Sense + OV3660 | MobileNetV2-0.35 96x96 INT8 | auto-refresh 2s</p>
   <script>
     function refresh() {
       document.getElementById('cam').src = '/capture?t=' + Date.now();
@@ -288,10 +280,8 @@ void handleResult() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== Veggie Classifier (YOLOv8n-cls on OV3660) ===\n");
+  Serial.println("\n=== Veggie Classifier (MobileNetV2-0.35 on OV3660) ===\n");
 
-  // PSRAM is required for the 1 MB tensor arena. If the board was flashed
-  // without the "OPI PSRAM" option, halt with a clear error.
   if (!psramFound()) {
     Serial.println("FATAL: PSRAM not detected. Set PSRAM=\"OPI PSRAM\" in "
                    "Tools menu and re-flash. Halting.");
@@ -325,7 +315,6 @@ void setup() {
   server.begin();
 #endif
 
-  // Allocate RGB888 decode buffer in PSRAM. fmt2rgb888() writes here each tick.
   const size_t rgb888_size = kCaptureWidth * kCaptureHeight * 3;
   rgb888_buf = (uint8_t*)heap_caps_malloc(rgb888_size, MALLOC_CAP_SPIRAM);
   if (!rgb888_buf) {
@@ -336,7 +325,6 @@ void setup() {
   Serial.printf("RGB888 decode buffer: %u bytes @ %p\n",
                 (unsigned)rgb888_size, rgb888_buf);
 
-  // Allocate tensor arena in PSRAM (16-byte aligned for TFLite).
   tensor_arena = (uint8_t*)heap_caps_aligned_alloc(16, kTensorArenaSize, MALLOC_CAP_SPIRAM);
   if (!tensor_arena) {
     Serial.printf("FATAL: Failed to allocate %d bytes of tensor arena in PSRAM.\n",
@@ -353,27 +341,24 @@ void setup() {
     while (true) delay(1000);
   }
 
-  // Ops used by YOLOv8n-cls INT8. If AllocateTensors() later complains
-  // "Didn't find op for builtin opcode ...", add that op here and re-flash.
-  static tflite::MicroMutableOpResolver<20> resolver;
+  // Ops used by MobileNetV2-0.35 INT8 + baked Lambda(preprocess_input).
+  // If AllocateTensors() later complains "Didn't find op for builtin opcode
+  // ...", add that op here and re-flash.
+  static tflite::MicroMutableOpResolver<14> resolver;
   resolver.AddConv2D();
   resolver.AddDepthwiseConv2D();
   resolver.AddFullyConnected();
-  resolver.AddMaxPool2D();
-  resolver.AddMean();                 // global avg pool in the classification head
+  resolver.AddAdd();                  // inverted-residual skip connections
+  resolver.AddPad();                  // stride-2 block padding
+  resolver.AddMean();                 // GlobalAveragePooling2D
+  resolver.AddReshape();              // after GAP, before Dense
   resolver.AddSoftmax();
-  resolver.AddLogistic();             // sigmoid, part of SiLU
-  resolver.AddMul();                  // x * sigmoid(x) for SiLU; residual scaling
-  resolver.AddAdd();                  // residual connections
-  resolver.AddConcatenation();        // C2f branches
-  resolver.AddSplit();                // C2f split (SPLIT op)
-  resolver.AddStridedSlice();         // C2f split when exported as STRIDED_SLICE
-  resolver.AddPad();
-  resolver.AddReshape();
-  resolver.AddTranspose();
-  resolver.AddResizeNearestNeighbor();
+  resolver.AddMul();                  // baked preprocess: x * (1/127.5)
+  resolver.AddSub();                  // baked preprocess: (x/127.5) - 1
   resolver.AddQuantize();
   resolver.AddDequantize();
+  resolver.AddLogistic();             // reserved — in case of hard_sigmoid
+  resolver.AddRelu6();                // MobileNetV2 activation
 
   static tflite::MicroInterpreter static_interpreter(
       tfl_model, resolver, tensor_arena, kTensorArenaSize);
@@ -421,7 +406,6 @@ void loop() {
   }
   unsigned long dt = millis() - t0;
 
-  // Dequantize output and take argmax.
   int8_t* out = output_tensor->data.int8;
   float max_conf = -1e30f;
   int   max_idx  = -1;

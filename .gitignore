@@ -2,4 +2,8 @@
 veggie_classification/data/
 veggie_classification/train/classification_V1/runs/
 veggie_classification/train/classification_V1/yolo_dataset/
+veggie_classification/train/classification_V2/runs/
+veggie_classification/train/classification_V2/mnv2_dataset/
+veggie_classification/train/classification_V3/runs/
+veggie_classification/train/classification_V3/mnv2_dataset/
 veggie_classification/train/Veggie_inferencing/
