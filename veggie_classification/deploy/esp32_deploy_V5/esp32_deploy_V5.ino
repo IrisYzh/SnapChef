@@ -105,7 +105,7 @@ int32_t output_zero_point = 0;
 //       veggie, yet the display flips to Uncertain and back.
 //
 // Asymmetric filter, three tiers:
-//   1. Snap-lock: if RAW confidence >= HIGH_CONF_LOCK (0.80), display that
+//   1. Snap-lock: if RAW confidence >= HIGH_CONF_LOCK (0.90), display that
 //      label immediately. This covers both "showed a clear veggie" and "user
 //      swapped to a different veggie". Bypasses EMA lag.
 //   2. EMA band: when raw is borderline, argmax the low-pass-filtered
@@ -113,7 +113,7 @@ int32_t output_zero_point = 0;
 //   3. Sticky release: once a label is shown, only flip to Uncertain after
 //      UNKNOWN_HOLD (4) consecutive below-threshold frames ~= 8 s of
 //      sustained uncertainty. One glitch frame is ignored.
-constexpr float HIGH_CONF_LOCK = 0.80f;
+constexpr float HIGH_CONF_LOCK = 0.90f;
 constexpr float EMA_ALPHA      = 0.5f;
 constexpr int   UNKNOWN_HOLD   = 4;
 
