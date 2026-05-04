@@ -60,7 +60,7 @@ constexpr int kTensorArenaSize = 512 * 1024;
 //     before a shown label is cleared.
 //   So one isolated >90% frame won't briefly flash a label, and one
 //   isolated <90% frame won't briefly clear a stable label.
-constexpr float CONF_LOCK             = 0.90f;
+constexpr float CONF_LOCK             = 0.80f;
 constexpr int   LOCK_STREAK_NEEDED    = 3;
 constexpr int   RELEASE_STREAK_NEEDED = 3;
 
