@@ -1,0 +1,10 @@
+{
+  "additionalFiles": "../..,../..,../..,../..,../..,../..,../..,../..",
+  "builtInLibrariesFolders": "/Users/iris/Library/Arduino15/libraries",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:esp32s3:UploadSpeed=115200,USBMode=hwcdc,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio,FlashSize=8M,PartitionScheme=huge_app,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default",
+  "hardwareFolders": "/Users/iris/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8,/Users/iris/Library/Arduino15/packages/esp32/hardware/esp32/3.3.8",
+  "otherLibrariesFolders": "/Users/iris/Documents/Arduino/libraries",
+  "sketchLocation": "/Users/iris/Library/Mobile Documents/com~apple~CloudDocs/Desktop/UW/515 Hardware Software Lab2/SnapChef/UI/SnapChef_UI"
+}
