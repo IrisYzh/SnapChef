@@ -54,7 +54,8 @@ display (UI, IN_FRIDGE in NVS) ──BLE──▶ main (sensors, camera, WiFi, r
 
 ### `src/main/` — XIAO ESP32S3 Sense
 
-- Board: `XIAO_ESP32S3` · PSRAM: **OPI PSRAM** · Partition: **Huge APP (3 MB / 1 MB SPIFFS)** · USB CDC On Boot: **Enabled**
+- Board: `XIAO_ESP32S3` · PSRAM: **OPI PSRAM** · Partition: **Huge APP (3 MB No OTA / 1 MB SPIFFS)** · USB CDC On Boot: **Enabled**
+  - The default 4 MB partition (1.25 MB app) is too small — the binary lands around 2 MB once TFLM model + WiFi/SSL + NimBLE all link in. Huge App fits with ~30 % headroom. Re-confirm this in *Tools → Partition Scheme* every time the board is changed; Arduino IDE 2.x sometimes resets it.
 - Libraries: `TensorFlowLite_ESP32`, `NimBLE-Arduino` (~v1.4.x signatures used), built-in `WiFi` / `WiFiClientSecure` / `HTTPClient`
 - Hardware: HC-SR04 → `TRIG = GPIO2`, `ECHO = GPIO1` (10 kΩ + 20 kΩ divider on echo). Camera on the FFC.
 - Bundles `model_data.h` + `labels.h` copied verbatim from `veggie_classification/deploy/esp32_deploy_V6/` — the 10 trained classes are **Bellpepper, Broccoli, Cabbage, Carrot, Eggplant, Garlic, Onion, Potato, Tomato, Unknown**.

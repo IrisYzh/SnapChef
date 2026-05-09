@@ -572,13 +572,14 @@ static void sendData(const String& payload) {
 //                          BLE: server callbacks
 // ============================================================================
 
+// NimBLE-Arduino v2.x callback signatures (v1 had no NimBLEConnInfo arg).
 class ServerCb : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* /*srv*/) override {
+    void onConnect(NimBLEServer* /*srv*/, NimBLEConnInfo& /*info*/) override {
         bleConnected = true;
         Serial.println("[ble] client connected");
         // Suspend advertising while connected (single-peer design).
     }
-    void onDisconnect(NimBLEServer* /*srv*/) override {
+    void onDisconnect(NimBLEServer* /*srv*/, NimBLEConnInfo& /*info*/, int /*reason*/) override {
         bleConnected = false;
         Serial.println("[ble] client disconnected, restarting adv");
         gCancelRequested = true;       // abort any in-flight scan
@@ -587,7 +588,7 @@ class ServerCb : public NimBLEServerCallbacks {
 };
 
 class CmdCb : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* c) override {
+    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& /*info*/) override {
         std::string v = c->getValue();
         String s(v.c_str());
         Serial.printf("[ble:cmd] %s\n", s.c_str());
@@ -604,7 +605,7 @@ class CmdCb : public NimBLECharacteristicCallbacks {
 static void initBle() {
     NimBLEDevice::init(SNAPCHEF_BLE_NAME);
     NimBLEDevice::setMTU(247);
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setPower(9);   // +9 dBm; v2 takes raw int8_t
 
     bleServer = NimBLEDevice::createServer();
     bleServer->setCallbacks(new ServerCb());
@@ -625,7 +626,7 @@ static void initBle() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(SNAPCHEF_SVC_UUID);
     adv->setName(SNAPCHEF_BLE_NAME);
-    adv->setScanResponse(true);
+    adv->enableScanResponse(true);   // v2 rename of setScanResponse
     adv->start();
     Serial.println("[ble] advertising");
 }

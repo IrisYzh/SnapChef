@@ -112,9 +112,12 @@ static NimBLEClient*         bleCli      = nullptr;
 static NimBLERemoteCharacteristic* bleCmd  = nullptr;
 static NimBLERemoteCharacteristic* bleEvt  = nullptr;
 static NimBLERemoteCharacteristic* bleData = nullptr;
-static volatile bool         bleConnected = false;
+static volatile bool         bleConnected  = false;
 static volatile bool         bleShouldScan = true;
-static NimBLEAdvertisedDevice* bleTarget   = nullptr;
+// v2 prefers connect-by-address; we capture the matched peer's address in
+// the scan callback and consume it from the main loop.
+static NimBLEAddress         bleTargetAddr;
+static volatile bool         bleHasTarget  = false;
 
 // Reassembly of "<seq>/<total>|<frag>" frames on the data characteristic.
 static String dataAccum;
@@ -167,26 +170,31 @@ static void dataNotifyCb(NimBLERemoteCharacteristic* /*c*/,
     }
 }
 
+// NimBLE-Arduino v2.x callback signatures.
 class CliCb : public NimBLEClientCallbacks {
     void onConnect(NimBLEClient* /*c*/) override {
         Serial.println("[ble] connected to peer");
     }
-    void onDisconnect(NimBLEClient* /*c*/) override {
+    void onDisconnect(NimBLEClient* /*c*/, int /*reason*/) override {
         Serial.println("[ble] disconnected");
         bleConnected = false;
         bleShouldScan = true;
     }
 };
 
-class ScanCb : public NimBLEAdvertisedDeviceCallbacks {
-    void onResult(NimBLEAdvertisedDevice* dev) override {
+// v2 split scan callbacks out of NimBLEAdvertisedDeviceCallbacks.
+class ScanCb : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* dev) override {
         if (dev->isAdvertisingService(NimBLEUUID(SNAPCHEF_SVC_UUID))) {
             Serial.printf("[ble] found %s rssi=%d\n",
                           dev->getName().c_str(), dev->getRSSI());
             NimBLEDevice::getScan()->stop();
-            if (bleTarget) delete bleTarget;
-            bleTarget = new NimBLEAdvertisedDevice(*dev);
+            bleTargetAddr = dev->getAddress();
+            bleHasTarget  = true;
         }
+    }
+    void onScanEnd(const NimBLEScanResults& /*results*/, int /*reason*/) override {
+        if (!bleConnected && !bleHasTarget) bleShouldScan = true;
     }
 };
 
@@ -199,12 +207,12 @@ static void bleSendCmd(const String& json) {
     bleCmd->writeValue((uint8_t*)json.c_str(), json.length(), false);
 }
 
-static bool bleConnectTo(NimBLEAdvertisedDevice* dev) {
+static bool bleConnectTo(const NimBLEAddress& addr) {
     if (!bleCli) {
         bleCli = NimBLEDevice::createClient();
         bleCli->setClientCallbacks(new CliCb(), false);
     }
-    if (!bleCli->connect(dev)) return false;
+    if (!bleCli->connect(addr)) return false;
 
     NimBLERemoteService* svc = bleCli->getService(SNAPCHEF_SVC_UUID);
     if (!svc) { bleCli->disconnect(); return false; }
@@ -215,7 +223,8 @@ static bool bleConnectTo(NimBLEAdvertisedDevice* dev) {
 
     if (bleEvt->canNotify())  bleEvt->subscribe(true,  evtNotifyCb);
     if (bleData->canNotify()) bleData->subscribe(true, dataNotifyCb);
-    bleCli->setMTU(247);
+    // MTU is negotiated globally via NimBLEDevice::setMTU; v2 removed
+    // NimBLEClient::setMTU.
 
     bleConnected = true;
     return true;
@@ -224,9 +233,9 @@ static bool bleConnectTo(NimBLEAdvertisedDevice* dev) {
 static void bleInit() {
     NimBLEDevice::init("SnapChef-Display");
     NimBLEDevice::setMTU(247);
-    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+    NimBLEDevice::setPower(9);   // +9 dBm; v2 takes raw int8_t
     NimBLEScan* scan = NimBLEDevice::getScan();
-    scan->setAdvertisedDeviceCallbacks(new ScanCb(), false);
+    scan->setScanCallbacks(new ScanCb(), false);   // v2 rename
     scan->setActiveScan(true);
     scan->setInterval(80);
     scan->setWindow(40);
@@ -234,11 +243,11 @@ static void bleInit() {
 
 static void bleTick() {
     if (bleConnected) return;
-    if (bleTarget) {
+    if (bleHasTarget) {
         Serial.println("[ble] connecting…");
-        bool ok = bleConnectTo(bleTarget);
-        delete bleTarget;
-        bleTarget = nullptr;
+        NimBLEAddress addr = bleTargetAddr;
+        bleHasTarget = false;
+        bool ok = bleConnectTo(addr);
         if (!ok) {
             Serial.println("[ble] connect failed");
             bleShouldScan = true;
@@ -248,10 +257,9 @@ static void bleTick() {
     if (bleShouldScan) {
         bleShouldScan = false;
         Serial.println("[ble] scanning…");
-        NimBLEDevice::getScan()->start(3, [](NimBLEScanResults){
-            // Restart scan on next tick if nothing matched.
-            bleShouldScan = (bleTarget == nullptr) && !bleConnected;
-        }, false);
+        // v2: scan duration in ms; ScanCb::onScanEnd flips bleShouldScan
+        // back on if we time out without finding anything.
+        NimBLEDevice::getScan()->start(3000, false, true);
     }
 }
 
