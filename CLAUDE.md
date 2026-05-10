@@ -89,7 +89,7 @@ Anything called from a NimBLE callback must `lvgl_port_lock(-1)` before touching
 
 ## Pitfalls worth remembering
 
-- **Don't re-init the camera** to switch resolution. Use `s->set_framesize` then `drainCameraFrames(2-3)` so the next `esp_camera_fb_get` returns a frame at the new settings. Same pattern is needed in both directions.
+- **Init the camera at the largest framesize you'll ever use, then `set_framesize` down at runtime.** `esp_camera_init` sizes the DMA / JPEG buffer once based on `config.frame_size`; `set_framesize` only reprograms the sensor, not the buffer. Upshifting from a smaller init size (e.g. QVGA → UXGA) overflows the DMA buffer and you get `cam_hal: FB-OVF` followed by `esp_camera_fb_get()` returning NULL. Current pattern: init at UXGA + quality 12, immediately `set_framesize(QVGA)` + `set_quality(10)` for veggie streaming, upshift back to UXGA inside `runReceiptScan`. Always `drainCameraFrames(2-3)` after a sensor change so the next grab is at the new settings; never `esp_camera_deinit` + reinit.
 - **Don't add a UXGA RGB888 buffer.** The TFLM path decodes to a 320×240 buffer; receipt path forwards JPEG bytes only. Keeping that invariant lets the static `rgb888_buf` stay small.
 - **Recipe ingredient list ordering matters** for the mock: `buildRecipeMock` matches `Carrot` first, then `Eggplant`, else generic. If you add another mock, add it in `src/main/main.ino` and update this section.
 - **API key + WiFi password** are hardcoded — never commit a real key. Scrub before pushing.

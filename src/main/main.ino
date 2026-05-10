@@ -203,11 +203,12 @@ static bool initCamera() {
     config.pin_reset    = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
-    // Boot in QVGA (cheap streaming for veggie path); receipt path runtime-
-    // upgrades the sensor to UXGA before its single capture and steps back
-    // down afterward.
-    config.frame_size   = FRAMESIZE_QVGA;
-    config.jpeg_quality = 10;
+    // Init at UXGA so the camera DMA buffer is sized for the largest capture
+    // we'll ever do (receipt path). Sensor is immediately downshifted to QVGA
+    // below for the veggie streaming path; runtime set_framesize() can then
+    // safely upshift back to UXGA without FB-OVF.
+    config.frame_size   = FRAMESIZE_UXGA;
+    config.jpeg_quality = 12;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -226,6 +227,10 @@ static bool initCamera() {
         s->set_exposure_ctrl(s, 1);
         s->set_aec2(s, 1);
         s->set_gain_ctrl(s, 1);
+        // DMA buffer is sized for UXGA above; drop the sensor down to QVGA for
+        // veggie streaming. Receipt path will upshift back to UXGA on demand.
+        s->set_framesize(s, FRAMESIZE_QVGA);
+        s->set_quality(s, 10);
     }
 
     rgb888_buf = (uint8_t*)heap_caps_malloc(CAPTURE_W * CAPTURE_H * 3, MALLOC_CAP_SPIRAM);
@@ -474,6 +479,8 @@ static String uploadReceipt(const uint8_t* jpeg, size_t jpeg_len,
 
     Serial.printf("[receipt] HTTP %d in %lu ms, %u bytes\n",
                   code, dt, (unsigned)resp.length());
+    Serial.print("[receipt] body: ");
+    Serial.println(resp);
     if (code != 200) {
         errCode = "http_" + String(code);
         errMsg  = resp.length() ? resp : "HTTP error";
