@@ -127,9 +127,13 @@ static void dataNotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
         if (data[i] == '/' && sep1 < 0) sep1 = i;
         else if (data[i] == '|' && sep1 >= 0) { sep2 = i; break; }
     }
-    if (sep1 < 0 || sep2 < 0) return;
+    if (sep1 < 0 || sep2 < 0) {
+        Serial.printf("[ble:data] bad framing, len=%d\n", (int)len);
+        return;
+    }
     int seq   = atoi((const char*)data);
     int total = atoi((const char*)data + sep1 + 1);
+    Serial.printf("[ble:data] seq=%d/%d len=%d\n", seq, total, (int)len);
     if (seq == 1) {
         resetDataAccum();
         dataExpectedTotal = total;
@@ -1390,6 +1394,7 @@ static void onEvent(const String& json) {
 
 static void onData(const String& payload) {
     String evt = jsonStrField(payload, "evt");
+    Serial.printf("[onData] evt=%s len=%d\n", evt.c_str(), (int)payload.length());
     lvgl_port_lock(-1);
     stopScanAnim();
     if (evt == "receipt_result")     showReceiptResult(payload);

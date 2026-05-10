@@ -782,12 +782,12 @@ static void runReceiptCapture() {
         gState = STATE_IDLE; return;
     }
 
-    // Heavy WiFi/TLS just finished; give BLE coex a moment to drain its queue
-    // before pushing the result notify + chunked data, otherwise the first
-    // notifications can be silently dropped.
-    delay(150);
+    // Heavy WiFi/TLS just finished; give BLE coex a generous moment to drain
+    // its queue before pushing the result notify + chunked data. Without this,
+    // the first notifications after upload are silently dropped on the radio.
+    delay(500);
     sendEvent("{\"evt\":\"receipt_result\"}");
-    delay(50);
+    delay(100);
     sendData(resp);
     gState = STATE_IDLE;
 }
