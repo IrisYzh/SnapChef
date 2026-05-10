@@ -38,6 +38,7 @@
 
 #include <esp_camera.h>
 #include <esp_heap_caps.h>
+#include <mbedtls/base64.h>
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -114,6 +115,7 @@ enum MainState {
     STATE_IDLE,
     STATE_VEGGIE_SCAN,
     STATE_RECEIPT_CAPTURE,
+    STATE_RECEIPT_REVIEW,
     STATE_RECEIPT_UPLOAD,
     STATE_RECIPE,
 };
@@ -122,6 +124,12 @@ static volatile MainState gState = STATE_IDLE;
 static volatile bool gCancelRequested = false;
 static String  gPendingPurpose = "in";           // for veggie scan
 static String  gPendingIngredientsJson = "[]";   // for recipe
+
+// Held JPEG between capture and confirm (review-then-upload flow).
+static uint8_t* gReceiptJpeg    = nullptr;
+static size_t   gReceiptJpegLen = 0;
+static int      gReceiptW       = 0;
+static int      gReceiptH       = 0;
 
 // --- TFLM ---
 static uint8_t* tensor_arena = nullptr;
@@ -162,6 +170,9 @@ static bool captureAndPreprocess(int8_t* dst);
 static void resetSmoothing();
 static void runVeggieScan();
 static void runReceiptScan();
+static void runReceiptCapture();
+static void runReceiptConfirm();
+static void freeReceiptJpeg();
 static void runRecipe();
 static void sendEvent(const String& json);
 static void sendData(const String& payload);
@@ -778,6 +789,139 @@ static void runReceiptScan() {
     gState = STATE_IDLE;
 }
 
+// ---------------------------------------------------------------------------
+//  Two-step receipt flow: capture (snap + send back JPEG) → confirm (upload).
+//  Lets the display show the captured frame so the user can retake before
+//  spending the OCR API call.
+// ---------------------------------------------------------------------------
+
+static void freeReceiptJpeg() {
+    if (gReceiptJpeg) {
+        heap_caps_free(gReceiptJpeg);
+        gReceiptJpeg = nullptr;
+    }
+    gReceiptJpegLen = 0;
+    gReceiptW = gReceiptH = 0;
+}
+
+static void runReceiptCapture() {
+    // Drop any previously-held frame on a retake.
+    freeReceiptJpeg();
+
+    gState = STATE_RECEIPT_CAPTURE;
+    sendEvent("{\"evt\":\"receipt_capturing\"}");
+
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) {
+        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"sensor\",\"msg\":\"no sensor\"}");
+        gState = STATE_IDLE; return;
+    }
+
+    // SVGA balances OCR fidelity with BLE transfer time (~1-3 s vs UXGA's 5-10 s).
+    s->set_framesize(s, FRAMESIZE_SVGA);
+    s->set_quality(s, 12);
+    drainCameraFrames(3);
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"capture\",\"msg\":\"capture failed\"}");
+        s->set_framesize(s, FRAMESIZE_QVGA);
+        s->set_quality(s, 10);
+        drainCameraFrames(2);
+        gState = STATE_IDLE; return;
+    }
+    Serial.printf("[receipt] captured %ux%u %u bytes\n",
+                  (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len);
+
+    gReceiptJpegLen = fb->len;
+    gReceiptW       = (int)fb->width;
+    gReceiptH       = (int)fb->height;
+    gReceiptJpeg    = (uint8_t*)heap_caps_malloc(gReceiptJpegLen, MALLOC_CAP_SPIRAM);
+    bool copied = false;
+    if (gReceiptJpeg) { memcpy(gReceiptJpeg, fb->buf, gReceiptJpegLen); copied = true; }
+    esp_camera_fb_return(fb);
+
+    // Drop sensor back to streaming res so the veggie path stays fast.
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 10);
+    drainCameraFrames(2);
+
+    if (!copied) {
+        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"oom\",\"msg\":\"jpeg copy failed\"}");
+        freeReceiptJpeg();
+        gState = STATE_IDLE; return;
+    }
+
+    // Base64-encode into a PSRAM buffer (output is ~4/3 the input size).
+    size_t out_cap = ((gReceiptJpegLen + 2) / 3) * 4 + 16;
+    char*  b64     = (char*)heap_caps_malloc(out_cap, MALLOC_CAP_SPIRAM);
+    if (!b64) {
+        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"oom\",\"msg\":\"b64 alloc\"}");
+        freeReceiptJpeg();
+        gState = STATE_IDLE; return;
+    }
+    size_t b64_len = 0;
+    int rc = mbedtls_base64_encode((unsigned char*)b64, out_cap, &b64_len,
+                                    gReceiptJpeg, gReceiptJpegLen);
+    if (rc != 0) {
+        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"b64\",\"msg\":\"encode failed\"}");
+        heap_caps_free(b64);
+        freeReceiptJpeg();
+        gState = STATE_IDLE; return;
+    }
+
+    // Build the JSON envelope around the base64 blob and stream it.
+    String payload;
+    payload.reserve(b64_len + 96);
+    payload  = "{\"evt\":\"receipt_image\",\"w\":";
+    payload += gReceiptW;
+    payload += ",\"h\":";
+    payload += gReceiptH;
+    payload += ",\"data\":\"";
+    payload.concat(b64, b64_len);
+    payload += "\"}";
+    heap_caps_free(b64);
+
+    sendEvent("{\"evt\":\"receipt_image_pending\"}");
+    sendData(payload);
+
+    // Hold the JPEG; wait for confirm/cancel/retake from the display.
+    gState = STATE_RECEIPT_REVIEW;
+    Serial.printf("[receipt] held %u JPEG bytes for review\n",
+                  (unsigned)gReceiptJpegLen);
+}
+
+static void runReceiptConfirm() {
+    if (!gReceiptJpeg || gReceiptJpegLen == 0) {
+        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"no_image\",\"msg\":\"no captured frame\"}");
+        gState = STATE_IDLE; return;
+    }
+
+    gState = STATE_RECEIPT_UPLOAD;
+    sendEvent("{\"evt\":\"receipt_uploading\"}");
+
+    String errCode, errMsg;
+    String resp = uploadReceipt(gReceiptJpeg, gReceiptJpegLen, errCode, errMsg);
+    freeReceiptJpeg();
+
+    if (resp.length() == 0) {
+        String j = "{\"evt\":\"receipt_error\",\"code\":\"";
+        j += errCode; j += "\",\"msg\":\"";
+        for (size_t i = 0; i < errMsg.length() && i < 200; i++) {
+            char c = errMsg[i];
+            if (c == '"' || c == '\\' || c == '\n' || c == '\r') c = ' ';
+            j += c;
+        }
+        j += "\"}";
+        sendEvent(j);
+        gState = STATE_IDLE; return;
+    }
+
+    sendEvent("{\"evt\":\"receipt_result\"}");
+    sendData(resp);
+    gState = STATE_IDLE;
+}
+
 static void runRecipe() {
     gState = STATE_RECIPE;
     String recipe = buildRecipeMock(gPendingIngredientsJson);
@@ -788,7 +932,10 @@ static void runRecipe() {
 
 static void handleCmd(const String& cmd) {
     String name = extractStringField(cmd, "cmd");
-    if (gState != STATE_IDLE && name != "cancel") {
+    // Capture/confirm are allowed to interrupt REVIEW state (retake, confirm).
+    bool reviewMode = (gState == STATE_RECEIPT_REVIEW);
+    bool reviewCmd  = (name == "capture_receipt" || name == "confirm_receipt");
+    if (gState != STATE_IDLE && name != "cancel" && !(reviewMode && reviewCmd)) {
         Serial.printf("[cmd] busy, dropping %s\n", name.c_str());
         sendEvent("{\"evt\":\"error\",\"code\":\"busy\",\"msg\":\"already running\"}");
         return;
@@ -800,6 +947,12 @@ static void handleCmd(const String& cmd) {
         runVeggieScan();
     } else if (name == "start_receipt_scan") {
         runReceiptScan();
+    } else if (name == "capture_receipt") {
+        runReceiptCapture();
+    } else if (name == "confirm_receipt") {
+        runReceiptConfirm();
+    } else if (name == "start_receipt_preview") {
+        // Legacy no-op: display used to send this for a static viewfinder UI.
     } else if (name == "get_recipe") {
         gPendingIngredientsJson = extractArrayField(cmd, "ingredients");
         runRecipe();
@@ -845,6 +998,14 @@ void loop() {
         String c = gPendingCmd;
         gCmdPending = false;
         handleCmd(c);
+    }
+
+    // Cancel during the review wait: drop the held frame and go idle.
+    if (gCancelRequested && gState == STATE_RECEIPT_REVIEW) {
+        Serial.println("[receipt] review cancelled");
+        freeReceiptJpeg();
+        gCancelRequested = false;
+        gState = STATE_IDLE;
     }
 
     // 2. HC-SR04 proximity wake (only when idle and a peer is connected).
