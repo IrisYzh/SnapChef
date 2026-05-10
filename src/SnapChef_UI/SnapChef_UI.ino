@@ -15,8 +15,6 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <mbedtls/base64.h>
-#include <esp_heap_caps.h>
 
 #include "snapchef_ble.h"
 
@@ -232,7 +230,6 @@ static lv_obj_t* scr_submode          = nullptr;
 static lv_obj_t* scr_scan             = nullptr;
 static lv_obj_t* scr_veggie_result    = nullptr;
 static lv_obj_t* scr_receipt_prep     = nullptr;
-static lv_obj_t* scr_receipt_review   = nullptr;
 static lv_obj_t* scr_receipt_result   = nullptr;
 static lv_obj_t* scr_recipe_prompt    = nullptr;
 static lv_obj_t* scr_recipe_result    = nullptr;
@@ -268,13 +265,6 @@ static String    to_pending_name;
 static lv_obj_t* rec_title_lbl = nullptr;
 static lv_obj_t* rec_time_lbl  = nullptr;
 static lv_obj_t* rec_steps_obj = nullptr;
-
-// Receipt review (captured photo confirmation)
-static lv_obj_t*    rev_image         = nullptr;
-static lv_obj_t*    rev_status_lbl    = nullptr;
-static uint8_t*     g_receipt_jpg_buf = nullptr;
-static size_t       g_receipt_jpg_len = 0;
-static lv_img_dsc_t g_receipt_img_dsc;
 
 // Receipt result
 struct ReceiptItem { String name; bool needs_refrig; bool checked; };
@@ -373,9 +363,6 @@ static void buildScan();
 static void buildVeggieResult();
 static void buildTakeOutResult();
 static void buildReceiptPrep();
-static void buildReceiptReview();
-static void showReceiptReview(const String& json);
-static void freeReceiptJpgBuf();
 static void buildReceiptResult();
 static void buildRecipePrompt();
 static void buildRecipeResult();
@@ -1011,154 +998,6 @@ static void buildReceiptPrep() {
 }
 
 // ============================================================================
-//                          SCREEN: receipt review
-//   Shows the JPEG main just captured. User confirms (sends for OCR) or
-//   retakes (asks main for a new frame) or cancels.
-// ============================================================================
-
-static void freeReceiptJpgBuf() {
-    if (g_receipt_jpg_buf) {
-        heap_caps_free(g_receipt_jpg_buf);
-        g_receipt_jpg_buf = nullptr;
-    }
-    g_receipt_jpg_len = 0;
-}
-
-static void onReviewConfirmCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"confirm_receipt\"}");
-    if (scan_status_label) lv_label_set_text(scan_status_label, "Reading receipt");
-    gUiState = UI_SCANNING;
-    startScanAnim();
-    switchScreen(scr_scan);
-}
-
-static void onReviewRetakeCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"capture_receipt\"}");
-    if (scan_status_label) lv_label_set_text(scan_status_label, "Taking photo");
-    gUiState = UI_SCANNING;
-    startScanAnim();
-    switchScreen(scr_scan);
-}
-
-static void onReviewCancelCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"cancel\"}");
-    if (rev_image) lv_img_set_src(rev_image, NULL);
-    freeReceiptJpgBuf();
-    gUiState = UI_SUBMODE_SELECT;
-    switchScreen(scr_submode);
-}
-
-static void buildReceiptReview() {
-    scr_receipt_review = makeScreen();
-
-    // Header
-    lv_obj_t* h = lv_obj_create(scr_receipt_review);
-    lv_obj_set_size(h, 800, 56); lv_obj_set_pos(h, 0, 0);
-    lv_obj_set_style_bg_color(h, COLOR_CARD, 0);
-    lv_obj_set_style_radius(h, 0, 0);
-    lv_obj_set_style_border_side(h, LV_BORDER_SIDE_BOTTOM, 0);
-    lv_obj_set_style_border_color(h, COLOR_ACCENT2, 0);
-    lv_obj_set_style_border_width(h, 2, 0);
-    lv_obj_clear_flag(h, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* ht = makeLabel(h, LV_SYMBOL_FILE " Captured Photo",
-                              &lv_font_montserrat_20, COLOR_ACCENT2);
-    lv_obj_align(ht, LV_ALIGN_LEFT_MID, 20, 0);
-
-    rev_status_lbl = makeLabel(h, "Confirm or retake",
-                                &lv_font_montserrat_14, COLOR_SUBTEXT);
-    lv_obj_align(rev_status_lbl, LV_ALIGN_RIGHT_MID, -20, 0);
-
-    // Frame around the captured image
-    lv_obj_t* frame = lv_obj_create(scr_receipt_review);
-    lv_obj_set_size(frame, 500, 320);
-    lv_obj_align(frame, LV_ALIGN_TOP_MID, 0, 64);
-    lv_obj_set_style_bg_color(frame, lv_color_hex(0x0A0A0A), 0);
-    lv_obj_set_style_border_color(frame, COLOR_ACCENT2, 0);
-    lv_obj_set_style_border_width(frame, 2, 0);
-    lv_obj_set_style_radius(frame, 6, 0);
-    lv_obj_set_style_pad_all(frame, 4, 0);
-    lv_obj_clear_flag(frame, LV_OBJ_FLAG_SCROLLABLE);
-
-    // The captured JPEG goes here. SVGA 800x600 scaled to ~60% fits 480x360.
-    rev_image = lv_img_create(frame);
-    lv_img_set_zoom(rev_image, 154);   // 154/256 ≈ 60%
-    lv_obj_align(rev_image, LV_ALIGN_CENTER, 0, 0);
-
-    lv_obj_t* cancel = makeButton(scr_receipt_review, "Cancel",
-                                   lv_color_hex(0x444444), onReviewCancelCb);
-    lv_obj_set_size(cancel, 160, 50);
-    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, -210, -16);
-
-    lv_obj_t* retake = makeButton(scr_receipt_review,
-                                   LV_SYMBOL_REFRESH " Retake",
-                                   lv_color_hex(0x555555), onReviewRetakeCb);
-    lv_obj_set_size(retake, 160, 50);
-    lv_obj_align(retake, LV_ALIGN_BOTTOM_MID, 0, -16);
-
-    lv_obj_t* confirm = makeButton(scr_receipt_review,
-                                    LV_SYMBOL_OK " Confirm",
-                                    COLOR_ACCENT2, onReviewConfirmCb);
-    lv_obj_set_size(confirm, 180, 50);
-    lv_obj_align(confirm, LV_ALIGN_BOTTOM_MID, 210, -16);
-}
-
-// Decode the base64 JPEG payload from main, hand it to LVGL, switch screens.
-static void showReceiptReview(const String& json) {
-    // Pull width/height (best-effort; SJPG decoder reads them from the stream).
-    int w = (int)jsonNumField(json, "w");
-    int h = (int)jsonNumField(json, "h");
-    String b64 = jsonStrField(json, "data");
-    if (b64.length() == 0) {
-        Serial.println("[receipt] no data field in receipt_image");
-        return;
-    }
-
-    // Allocate a fresh PSRAM buffer sized for the decode (3/4 of base64 length).
-    freeReceiptJpgBuf();
-    size_t cap = (b64.length() / 4) * 3 + 8;
-    g_receipt_jpg_buf = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM);
-    if (!g_receipt_jpg_buf) {
-        Serial.println("[receipt] PSRAM alloc failed");
-        return;
-    }
-
-    size_t out_len = 0;
-    int rc = mbedtls_base64_decode(g_receipt_jpg_buf, cap, &out_len,
-                                    (const unsigned char*)b64.c_str(),
-                                    b64.length());
-    if (rc != 0) {
-        Serial.printf("[receipt] base64 decode failed: %d\n", rc);
-        freeReceiptJpgBuf();
-        return;
-    }
-    g_receipt_jpg_len = out_len;
-    Serial.printf("[receipt] decoded %u JPEG bytes (%dx%d)\n",
-                  (unsigned)out_len, w, h);
-
-    // Hand the buffer to LVGL via an image descriptor; SJPG decoder picks up
-    // the JPEG from the SOI marker.
-    g_receipt_img_dsc.header.cf          = LV_IMG_CF_RAW;
-    g_receipt_img_dsc.header.always_zero = 0;
-    g_receipt_img_dsc.header.reserved    = 0;
-    g_receipt_img_dsc.header.w           = w > 0 ? w : 800;
-    g_receipt_img_dsc.header.h           = h > 0 ? h : 600;
-    g_receipt_img_dsc.data_size          = (uint32_t)g_receipt_jpg_len;
-    g_receipt_img_dsc.data               = g_receipt_jpg_buf;
-
-    if (rev_image) {
-        lv_img_set_src(rev_image, NULL);
-        lv_img_set_src(rev_image, &g_receipt_img_dsc);
-    }
-    if (rev_status_lbl) {
-        lv_label_set_text(rev_status_lbl, "Confirm or retake");
-        lv_obj_set_style_text_color(rev_status_lbl, COLOR_SUBTEXT, 0);
-    }
-
-    gUiState = UI_RECEIPT_RESULT;   // reuse a state slot
-    switchScreen(scr_receipt_review);
-}
-
-// ============================================================================
 //                          SCREEN: receipt result
 // ============================================================================
 
@@ -1177,6 +1016,14 @@ static void rcpConfirmCb(lv_event_t*) {
 
 static void rcpCancelCb(lv_event_t*) { gUiState = UI_ACTION_SELECT; switchScreen(scr_action); }
 
+static void rcpRetakeCb(lv_event_t*) {
+    bleSendCmd("{\"cmd\":\"capture_receipt\"}");
+    if (scan_status_label) lv_label_set_text(scan_status_label, "Capturing photo");
+    gUiState = UI_SCANNING;
+    startScanAnim();
+    switchScreen(scr_scan);
+}
+
 static void buildReceiptResult() {
     scr_receipt_result = makeScreen();
     makeHeader(scr_receipt_result, LV_SYMBOL_FILE " Receipt Items",
@@ -1193,13 +1040,19 @@ static void buildReceiptResult() {
 
     lv_obj_t* cancel = makeButton(scr_receipt_result, "Cancel",
                                    lv_color_hex(0x333333), rcpCancelCb);
-    lv_obj_set_size(cancel, 180, 48);
-    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, -110, -16);
+    lv_obj_set_size(cancel, 160, 48);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, -210, -16);
+
+    lv_obj_t* retake = makeButton(scr_receipt_result,
+                                   LV_SYMBOL_REFRESH " Retake",
+                                   lv_color_hex(0x555555), rcpRetakeCb);
+    lv_obj_set_size(retake, 160, 48);
+    lv_obj_align(retake, LV_ALIGN_BOTTOM_MID, 0, -16);
 
     lv_obj_t* confirm = makeButton(scr_receipt_result, LV_SYMBOL_OK " Confirm",
                                     COLOR_ACCENT, rcpConfirmCb);
     lv_obj_set_size(confirm, 180, 48);
-    lv_obj_align(confirm, LV_ALIGN_BOTTOM_MID, 110, -16);
+    lv_obj_align(confirm, LV_ALIGN_BOTTOM_MID, 210, -16);
 }
 
 static void showReceiptResult(const String& json) {
@@ -1539,9 +1392,8 @@ static void onData(const String& payload) {
     String evt = jsonStrField(payload, "evt");
     lvgl_port_lock(-1);
     stopScanAnim();
-    if (evt == "receipt_image")       showReceiptReview(payload);
-    else if (evt == "receipt_result") showReceiptResult(payload);
-    else if (evt == "recipe_result")  showRecipeResult(payload);
+    if (evt == "receipt_result")     showReceiptResult(payload);
+    else if (evt == "recipe_result") showRecipeResult(payload);
     lvgl_port_unlock();
 }
 
@@ -1578,7 +1430,6 @@ void setup() {
     buildVeggieResult();
     buildTakeOutResult();
     buildReceiptPrep();
-    buildReceiptReview();
     buildReceiptResult();
     buildRecipePrompt();
     buildRecipeResult();
