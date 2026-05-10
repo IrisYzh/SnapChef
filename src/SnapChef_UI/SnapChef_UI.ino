@@ -231,6 +231,7 @@ static lv_obj_t* scr_action           = nullptr;
 static lv_obj_t* scr_submode          = nullptr;
 static lv_obj_t* scr_scan             = nullptr;
 static lv_obj_t* scr_veggie_result    = nullptr;
+static lv_obj_t* scr_receipt_prep     = nullptr;
 static lv_obj_t* scr_receipt_review   = nullptr;
 static lv_obj_t* scr_receipt_result   = nullptr;
 static lv_obj_t* scr_recipe_prompt    = nullptr;
@@ -371,6 +372,7 @@ static void buildSubmode();
 static void buildScan();
 static void buildVeggieResult();
 static void buildTakeOutResult();
+static void buildReceiptPrep();
 static void buildReceiptReview();
 static void showReceiptReview(const String& json);
 static void freeReceiptJpgBuf();
@@ -516,10 +518,8 @@ static void onSubmodeVeggieCb(lv_event_t*) {
 }
 
 static void onSubmodeReceiptCb(lv_event_t*) {
-    gScanKind = "receipt"; gUiState = UI_SCANNING;
-    bleSendCmd("{\"cmd\":\"capture_receipt\"}");
-    if (scan_status_label) lv_label_set_text(scan_status_label, "Taking photo");
-    startScanAnim(); switchScreen(scr_scan);
+    gScanKind = "receipt";
+    switchScreen(scr_receipt_prep);
 }
 
 static void onSubmodeBackCb(lv_event_t*) { gUiState = UI_ACTION_SELECT; switchScreen(scr_action); }
@@ -942,6 +942,72 @@ static void showTakeOutResult(const String& label, float conf) {
 
     gUiState = UI_VEGGIE_RESULT;   // reuse state slot
     switchScreen(scr_takeout_result);
+}
+
+// ============================================================================
+//                          SCREEN: receipt prep
+//   Tells the user how to position the receipt before the camera fires.
+//   Capture button sends the actual capture_receipt command.
+// ============================================================================
+
+static void onPrepCaptureCb(lv_event_t*) {
+    bleSendCmd("{\"cmd\":\"capture_receipt\"}");
+    if (scan_status_label) lv_label_set_text(scan_status_label, "Taking photo");
+    gUiState = UI_SCANNING;
+    startScanAnim();
+    switchScreen(scr_scan);
+}
+
+static void onPrepCancelCb(lv_event_t*) {
+    gUiState = UI_SUBMODE_SELECT;
+    switchScreen(scr_submode);
+}
+
+static void buildReceiptPrep() {
+    scr_receipt_prep = makeScreen();
+
+    // Header
+    lv_obj_t* h = lv_obj_create(scr_receipt_prep);
+    lv_obj_set_size(h, 800, 56); lv_obj_set_pos(h, 0, 0);
+    lv_obj_set_style_bg_color(h, COLOR_CARD, 0);
+    lv_obj_set_style_radius(h, 0, 0);
+    lv_obj_set_style_border_side(h, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(h, COLOR_ACCENT2, 0);
+    lv_obj_set_style_border_width(h, 2, 0);
+    lv_obj_clear_flag(h, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* ht = makeLabel(h, LV_SYMBOL_FILE " Scan a Receipt",
+                              &lv_font_montserrat_22, COLOR_ACCENT2);
+    lv_obj_align(ht, LV_ALIGN_LEFT_MID, 20, 0);
+
+    // Big camera/photo icon
+    lv_obj_t* icon = makeLabel(scr_receipt_prep, LV_SYMBOL_IMAGE,
+                                &lv_font_montserrat_48, COLOR_ACCENT2);
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -110);
+
+    // Main instruction (centred)
+    lv_obj_t* instr = makeLabel(scr_receipt_prep,
+        "Place the receipt about 10 cm\nin front of the camera lens",
+        &lv_font_montserrat_22, COLOR_TEXT);
+    lv_obj_set_style_text_align(instr, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(instr, LV_ALIGN_CENTER, 0, -20);
+
+    // Sub-hint
+    lv_obj_t* hint = makeLabel(scr_receipt_prep,
+        "Hold steady, then tap Capture",
+        &lv_font_montserrat_16, COLOR_SUBTEXT);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 70);
+
+    // Buttons
+    lv_obj_t* cancel = makeButton(scr_receipt_prep, "Cancel",
+                                   lv_color_hex(0x444444), onPrepCancelCb);
+    lv_obj_set_size(cancel, 180, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, -110, -16);
+
+    lv_obj_t* cap = makeButton(scr_receipt_prep, LV_SYMBOL_OK " Capture",
+                                COLOR_ACCENT2, onPrepCaptureCb);
+    lv_obj_set_size(cap, 180, 50);
+    lv_obj_align(cap, LV_ALIGN_BOTTOM_MID, 110, -16);
 }
 
 // ============================================================================
@@ -1511,6 +1577,7 @@ void setup() {
     buildScan();
     buildVeggieResult();
     buildTakeOutResult();
+    buildReceiptPrep();
     buildReceiptReview();
     buildReceiptResult();
     buildRecipePrompt();
