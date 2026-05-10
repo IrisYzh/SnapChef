@@ -1376,10 +1376,26 @@ static void onEvent(const String& json) {
 
     if (evt == "receipt_result" || evt == "recipe_result") return;  // data arrives on data char
 
-    // DEBUG: single-frame test event from main carrying just the first item's
-    // name + needs_refrigeration. Lets us verify the BLE event channel and
-    // screen-switch logic independently of the chunked-data reassembly path.
-    if (evt == "receipt_test") {
+    // DEBUG: streamed receipts. `receipt_test_begin` is always sent first
+    // (even when total==0), so screen-switch and list-clear happen exactly
+    // once and don't depend on any item ever arriving. Each subsequent
+    // `receipt_item` carries one item; we just append a row.
+    if (evt == "receipt_test_begin") {
+        int total = (int)jsonNumField(json, "total");
+        Serial.printf("[receipt_test_begin] total=%d\n", total);
+        lvgl_port_lock(-1);
+        stopScanAnim();
+        rcp_items.clear();
+        lv_obj_clean(rcp_list_obj);
+        gUiState = UI_RECEIPT_RESULT;
+        switchScreen(scr_receipt_result);
+        lvgl_port_unlock();
+        return;
+    }
+
+    if (evt == "receipt_item") {
+        int idx   = (int)jsonNumField(json, "idx");
+        int total = (int)jsonNumField(json, "total");
         String name = jsonStrField(json, "name");
         String pat  = "\"needs_refrigeration\":";
         int i = json.indexOf(pat);
@@ -1389,15 +1405,39 @@ static void onEvent(const String& json) {
             while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
             needs_refrig = (json.substring(i, i + 4) == "true");
         }
-        Serial.printf("[receipt_test] name='%s' needs_refrig=%d\n",
-                      name.c_str(), (int)needs_refrig);
-        const char* b = needs_refrig ? "true" : "false";
-        String synth = String("{\"items\":[{\"name\":\"") + name +
-                       "\",\"needs_refrigeration\":" + b +
-                       ",\"checked\":" + b + "}]}";
+        Serial.printf("[receipt_item] %d/%d name='%s' refrig=%d\n",
+                      idx, total, name.c_str(), (int)needs_refrig);
+
         lvgl_port_lock(-1);
-        stopScanAnim();
-        showReceiptResult(synth);
+        ReceiptItem r;
+        r.name = name;
+        r.needs_refrig = needs_refrig;
+        r.checked = needs_refrig;
+        rcp_items.push_back(r);
+
+        lv_obj_t* row = lv_obj_create(rcp_list_obj);
+        lv_obj_set_size(row, 730, 50);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1E1E1E), 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_style_pad_all(row, 8, 0);
+
+        lv_obj_t* cb = lv_checkbox_create(row);
+        lv_checkbox_set_text(cb, name.c_str());
+        if (needs_refrig) lv_obj_add_state(cb, LV_STATE_CHECKED);
+        lv_obj_set_style_text_color(cb, COLOR_TEXT, 0);
+        lv_obj_set_style_text_font(cb, &lv_font_montserrat_16, 0);
+        lv_obj_align(cb, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_add_event_cb(cb, rcpItemToggleCb, LV_EVENT_VALUE_CHANGED,
+                            (void*)(intptr_t)(rcp_items.size() - 1));
+
+        if (needs_refrig) {
+            lv_obj_t* tag = makeLabel(row, LV_SYMBOL_OK " fridge",
+                                       &lv_font_montserrat_12, COLOR_ACCENT);
+            lv_obj_align(tag, LV_ALIGN_RIGHT_MID, -8, 0);
+        }
         lvgl_port_unlock();
         return;
     }

@@ -667,6 +667,78 @@ static String extractBoolField(const String& json, const char* key) {
     return "false";
 }
 
+// Walks "items":[...] in a receipt response and streams the first `maxItems`
+// out as one single-frame BLE event each:
+//   {"evt":"receipt_item","idx":k,"total":N,"name":"…","needs_refrigeration":bool}
+// Each event is well under the 244-byte single-notify ceiling, so this path
+// avoids the chunked-data reassembler entirely. Returns the number of items
+// emitted.
+static int sendReceiptTestStream(const String& resp, int maxItems) {
+    int items_pos = resp.indexOf("\"items\":[");
+    if (items_pos < 0) return 0;
+
+    // Pass 1: extract item ranges so we know `total` before emitting any event.
+    std::vector<int> starts, ends;
+    int p = items_pos + 9;
+    int depth = 0;
+    int item_start = -1;
+    while (p < (int)resp.length() && (int)starts.size() < maxItems) {
+        char c = resp[p];
+        if (c == '{') {
+            if (depth == 0) item_start = p;
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0 && item_start >= 0) {
+                starts.push_back(item_start);
+                ends.push_back(p + 1);
+                item_start = -1;
+            }
+        } else if (c == ']' && depth == 0) {
+            break;
+        }
+        p++;
+    }
+
+    int total = (int)starts.size();
+
+    // Always emit a "begin" frame first so the display can switch to the
+    // receipt-result screen and clear stale rows even when total == 0
+    // (empty items array — Textract OK but no products parsed).
+    {
+        String j = "{\"evt\":\"receipt_test_begin\",\"total\":";
+        j += String(total);
+        j += "}";
+        sendEvent(j);
+        delay(80);
+    }
+
+    for (int i = 0; i < total; i++) {
+        String item   = resp.substring(starts[i], ends[i]);
+        String name   = extractStringField(item, "name");
+        String refrig = extractBoolField(item, "needs_refrigeration");
+        String safeName;
+        safeName.reserve(name.length() + 4);
+        for (size_t k = 0; k < name.length(); k++) {
+            char ch = name[k];
+            if (ch == '"' || ch == '\\') safeName += '\\';
+            safeName += ch;
+        }
+        String j = "{\"evt\":\"receipt_item\",\"idx\":";
+        j += String(i);
+        j += ",\"total\":";
+        j += String(total);
+        j += ",\"name\":\"";
+        j += safeName;
+        j += "\",\"needs_refrigeration\":";
+        j += refrig;
+        j += "}";
+        sendEvent(j);
+        delay(80);   // spacing so consecutive notifies don't overflow TX queue
+    }
+    return total;
+}
+
 static String extractArrayField(const String& json, const char* key) {
     String pat = String("\"") + key + "\":[";
     int i = json.indexOf(pat);
@@ -799,21 +871,11 @@ static void runReceiptCapture() {
     // notifications after upload are silently dropped on the radio.
     delay(500);
 
-    // DEBUG: send only the first item's name + needs_refrigeration as a
-    // single-frame event so we can isolate whether the display receives
-    // anything at all (vs. the chunked-data reassembly path).
-    String firstName = extractStringField(resp, "name");
-    String refrig    = extractBoolField(resp, "needs_refrigeration");
-    String safeName;
-    safeName.reserve(firstName.length() + 4);
-    for (size_t i = 0; i < firstName.length(); i++) {
-        char c = firstName[i];
-        if (c == '"' || c == '\\') safeName += '\\';
-        safeName += c;
-    }
-    String testJson = String("{\"evt\":\"receipt_test\",\"name\":\"") +
-                      safeName + "\",\"needs_refrigeration\":" + refrig + "}";
-    sendEvent(testJson);
+    // DEBUG: stream the first 10 items as individual single-frame events.
+    // Small payloads, no chunked reassembler — easiest path to verify items
+    // are arriving on the display.
+    int n = sendReceiptTestStream(resp, 10);
+    Serial.printf("[receipt_test] streamed %d items\n", n);
     gState = STATE_IDLE;
 }
 
