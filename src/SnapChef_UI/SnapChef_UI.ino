@@ -1376,6 +1376,32 @@ static void onEvent(const String& json) {
 
     if (evt == "receipt_result" || evt == "recipe_result") return;  // data arrives on data char
 
+    // DEBUG: single-frame test event from main carrying just the first item's
+    // name + needs_refrigeration. Lets us verify the BLE event channel and
+    // screen-switch logic independently of the chunked-data reassembly path.
+    if (evt == "receipt_test") {
+        String name = jsonStrField(json, "name");
+        String pat  = "\"needs_refrigeration\":";
+        int i = json.indexOf(pat);
+        bool needs_refrig = false;
+        if (i >= 0) {
+            i += pat.length();
+            while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+            needs_refrig = (json.substring(i, i + 4) == "true");
+        }
+        Serial.printf("[receipt_test] name='%s' needs_refrig=%d\n",
+                      name.c_str(), (int)needs_refrig);
+        const char* b = needs_refrig ? "true" : "false";
+        String synth = String("{\"items\":[{\"name\":\"") + name +
+                       "\",\"needs_refrigeration\":" + b +
+                       ",\"checked\":" + b + "}]}";
+        lvgl_port_lock(-1);
+        stopScanAnim();
+        showReceiptResult(synth);
+        lvgl_port_unlock();
+        return;
+    }
+
     if (evt == "receipt_error" || evt == "error") {
         String msg = jsonStrField(json, "msg");
         if (!msg.length()) msg = jsonStrField(json, "code");

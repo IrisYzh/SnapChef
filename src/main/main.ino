@@ -655,6 +655,18 @@ static String extractStringField(const String& json, const char* key) {
     return json.substring(i, j);
 }
 
+// Returns "true" or "false" as a string (ready to splice into an outgoing
+// JSON payload). Defaults to "false" when the key is missing.
+static String extractBoolField(const String& json, const char* key) {
+    String pat = String("\"") + key + "\":";
+    int i = json.indexOf(pat);
+    if (i < 0) return "false";
+    i += pat.length();
+    while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+    if (json.substring(i, i + 4) == "true") return "true";
+    return "false";
+}
+
 static String extractArrayField(const String& json, const char* key) {
     String pat = String("\"") + key + "\":[";
     int i = json.indexOf(pat);
@@ -783,12 +795,25 @@ static void runReceiptCapture() {
     }
 
     // Heavy WiFi/TLS just finished; give BLE coex a generous moment to drain
-    // its queue before pushing the result notify + chunked data. Without this,
-    // the first notifications after upload are silently dropped on the radio.
+    // its queue before pushing notifications. Without this, the first
+    // notifications after upload are silently dropped on the radio.
     delay(500);
-    sendEvent("{\"evt\":\"receipt_result\"}");
-    delay(100);
-    sendData(resp);
+
+    // DEBUG: send only the first item's name + needs_refrigeration as a
+    // single-frame event so we can isolate whether the display receives
+    // anything at all (vs. the chunked-data reassembly path).
+    String firstName = extractStringField(resp, "name");
+    String refrig    = extractBoolField(resp, "needs_refrigeration");
+    String safeName;
+    safeName.reserve(firstName.length() + 4);
+    for (size_t i = 0; i < firstName.length(); i++) {
+        char c = firstName[i];
+        if (c == '"' || c == '\\') safeName += '\\';
+        safeName += c;
+    }
+    String testJson = String("{\"evt\":\"receipt_test\",\"name\":\"") +
+                      safeName + "\",\"needs_refrigeration\":" + refrig + "}";
+    sendEvent(testJson);
     gState = STATE_IDLE;
 }
 
