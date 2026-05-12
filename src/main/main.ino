@@ -9,7 +9,7 @@
  *   1. Idle proximity wake — emits {"evt":"proximity_wake"} when an object
  *      is detected within ~10 cm of the HC-SR04.
  *   2. Veggie classification — on {"cmd":"start_veggie_scan"} runs the
- *      MobileNetV2 INT8 classifier (96x96) lifted from esp32_deploy_V6.
+ *      MobileNetV2 INT8 classifier (128x128, V4 weights) lifted from esp32_deploy_V7.
  *      Locks on >=80% top-1 confidence over 3 consecutive frames; gives up
  *      after 20 s.
  *   3. Receipt scan — on {"cmd":"capture_receipt"} switches the camera to
@@ -79,8 +79,8 @@ static const unsigned long PROXIMITY_COOLDOWN_MS = 3000;
 // --- Veggie classifier (mirrors esp32_deploy_V6.ino) ---
 static const unsigned long INFERENCE_INTERVAL_MS = 500;
 static const unsigned long VEGGIE_TIMEOUT_MS     = 20000;
-static const int  IMG_W = 96, IMG_H = 96, IMG_C = 3;
-static const int  TENSOR_ARENA_SIZE = 512 * 1024;
+static const int  IMG_W = 128, IMG_H = 128, IMG_C = 3;     // V4 model: 128x128
+static const int  TENSOR_ARENA_SIZE = 700 * 1024;          // ~(128/96)^2 of V3's 512KB
 static const float CONF_LOCK = 0.80f;
 static const int   LOCK_STREAK_NEEDED    = 3;
 static const int   RELEASE_STREAK_NEEDED = 3;
