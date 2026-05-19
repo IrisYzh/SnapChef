@@ -4,7 +4,7 @@
 
 | 项 | 值 |
 |---|---|
-| Base URL | `https://snapchef-production.up.railway.app` |
+| Base URL | `https://snapchef-backend-production.up.railway.app` |
 | 协议 | HTTPS（TLS 1.2+，证书由 Let's Encrypt 签发）|
 | 认证方式 | HTTP Header `X-API-Key` |
 | 内容类型 | `multipart/form-data` |
@@ -58,7 +58,7 @@
 
 **示例 curl**：
 ```bash
-curl -X POST https://snapchef-production.up.railway.app/receipts/analyze \
+curl -X POST https://snapchef-backend-production.up.railway.app/receipts/analyze \
   -H "X-API-Key: <your-key>" \
   -F "image=@receipt.jpg;type=image/jpeg"
 ```
@@ -183,7 +183,7 @@ curl -X POST https://snapchef-production.up.railway.app/receipts/analyze \
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 
-#define API_URL "https://snapchef-production.up.railway.app/receipts/analyze"
+#define API_URL "https://snapchef-backend-production.up.railway.app/receipts/analyze"
 #define API_KEY "<your-key>"
 #define BOUNDARY "----snapchef32boundary"
 

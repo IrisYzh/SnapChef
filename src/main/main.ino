@@ -43,6 +43,7 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 
 #include <NimBLEDevice.h>
 
@@ -63,8 +64,8 @@ static const char* WIFI_SSID = "UW MPSK";
 static const char* WIFI_PASS = "45yVuUeU7At7gnxt";
 
 // --- Backend ---
-static const char* API_URL     = "https://snapchef-production.up.railway.app/receipts/analyze";
-static const char* HEALTHZ_URL = "https://snapchef-production.up.railway.app/healthz";
+static const char* API_URL     = "https://snapchef-backend-production.up.railway.app/receipts/analyze";
+static const char* HEALTHZ_URL = "https://snapchef-backend-production.up.railway.app/healthz";
 static const char* API_KEY     = "snapchefasdfghjkl123456789";
 static const char* BOUNDARY    = "----snapchef32boundary";
 static const int   HTTP_TIMEOUT_MS = 20000;
@@ -152,6 +153,12 @@ static volatile bool         bleConnected = false;
 // --- Pending commands queue (filled in BLE callback, drained in loop()) ---
 static volatile bool gCmdPending = false;
 static String gPendingCmd;
+
+// --- DEBUG: last captured receipt JPEG, served over HTTP for browser preview ---
+static WebServer  gDebugServer(80);
+static uint8_t*   gLastJpeg    = nullptr;
+static size_t     gLastJpegLen = 0;
+static uint32_t   gLastJpegSeq = 0;
 
 // ============================================================================
 //                              FORWARD DECLS
@@ -407,6 +414,57 @@ static bool connectWiFi() {
     Serial.printf("[wifi] connected ip=%s rssi=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI());
     return true;
+}
+
+// ============================================================================
+//                       DEBUG: receipt preview HTTP server
+// ============================================================================
+
+// Replaces gLastJpeg with a fresh copy of the JPEG bytes. Safe to call from
+// the same task that runs the camera (no concurrent reader in this firmware
+// other than gDebugServer.handleClient() in loop()).
+static void debugStoreReceiptJpeg(const uint8_t* jpeg, size_t len) {
+    if (gLastJpeg) { heap_caps_free(gLastJpeg); gLastJpeg = nullptr; gLastJpegLen = 0; }
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (!buf) { Serial.println("[debug] PSRAM alloc for preview JPEG failed"); return; }
+    memcpy(buf, jpeg, len);
+    gLastJpeg    = buf;
+    gLastJpegLen = len;
+    gLastJpegSeq++;
+    Serial.printf("[debug] preview JPEG ready, %u bytes — http://%s/\n",
+                  (unsigned)len, WiFi.localIP().toString().c_str());
+}
+
+static void debugServerHandleIndex() {
+    String html = "<!doctype html><meta charset=utf-8><title>SnapChef receipt</title>";
+    html += "<style>body{font-family:sans-serif;margin:16px;background:#111;color:#eee}"
+            "img{max-width:100%;border:1px solid #444}</style>";
+    html += "<h2>Last captured receipt</h2>";
+    if (gLastJpegLen == 0) {
+        html += "<p>No receipt captured yet. Trigger a receipt scan from the display.</p>";
+    } else {
+        html += "<p>" + String((unsigned)gLastJpegLen) + " bytes, seq " + String(gLastJpegSeq) + "</p>";
+        html += "<img src=\"/last.jpg?seq=" + String(gLastJpegSeq) + "\">";
+        html += "<script>setTimeout(()=>location.reload(), 3000)</script>";
+    }
+    gDebugServer.send(200, "text/html; charset=utf-8", html);
+}
+
+static void debugServerHandleJpeg() {
+    if (gLastJpegLen == 0 || !gLastJpeg) {
+        gDebugServer.send(404, "text/plain", "no jpeg yet");
+        return;
+    }
+    gDebugServer.sendHeader("Cache-Control", "no-store");
+    gDebugServer.send_P(200, "image/jpeg", (const char*)gLastJpeg, gLastJpegLen);
+}
+
+static void initDebugServer() {
+    gDebugServer.on("/",         debugServerHandleIndex);
+    gDebugServer.on("/last.jpg", debugServerHandleJpeg);
+    gDebugServer.begin();
+    Serial.printf("[debug] preview server on http://%s/\n",
+                  WiFi.localIP().toString().c_str());
 }
 
 static void healthzSelfCheck() {
@@ -833,6 +891,8 @@ static void runReceiptCapture() {
     uint8_t* jbuf = (uint8_t*)heap_caps_malloc(jlen, MALLOC_CAP_SPIRAM);
     bool copied = false;
     if (jbuf) { memcpy(jbuf, fb->buf, jlen); copied = true; }
+    // Cache a copy for the browser preview server before returning fb.
+    if (copied) debugStoreReceiptJpeg(jbuf, jlen);
     esp_camera_fb_return(fb);
 
     // Restore sensor for veggie streaming before doing the slow upload.
@@ -934,13 +994,19 @@ void setup() {
     Serial.printf("model OK, unknown_class_idx=%d\n", unknown_class_idx);
 
     connectWiFi();
-    if (WiFi.status() == WL_CONNECTED) healthzSelfCheck();
+    if (WiFi.status() == WL_CONNECTED) {
+        healthzSelfCheck();
+        initDebugServer();
+    }
 
     initBle();
     Serial.println("ready");
 }
 
 void loop() {
+    // 0. Service the debug preview HTTP server.
+    if (WiFi.status() == WL_CONNECTED) gDebugServer.handleClient();
+
     // 1. Pull pending command (filled by BLE write callback).
     if (gCmdPending) {
         String c = gPendingCmd;

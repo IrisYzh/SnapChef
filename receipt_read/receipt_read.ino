@@ -36,8 +36,8 @@ static const char* WIFI_SSID = "UW MPSK";
 static const char* WIFI_PASS = "45yVuUeU7At7gnxt";
 
 // Backend — get the API key from the project owner. Do NOT commit a real key.
-static const char* API_URL = "https://snapchef-production.up.railway.app/receipts/analyze";
-static const char* HEALTHZ_URL = "https://snapchef-production.up.railway.app/healthz";
+static const char* API_URL = "https://snapchef-backend-production.up.railway.app/receipts/analyze";
+static const char* HEALTHZ_URL = "https://snapchef-backend-production.up.railway.app/healthz";
 static const char* API_KEY = "snapchefasdfghjkl123456789";
 
 // Multipart boundary — any unique ASCII token.
