@@ -258,8 +258,10 @@ static lv_obj_t* scr_action           = nullptr;
 static lv_obj_t* scr_submode          = nullptr;
 static lv_obj_t* scr_scan             = nullptr;
 static lv_obj_t* scr_veggie_result    = nullptr;
-static lv_obj_t* scr_receipt_prep     = nullptr;
-static lv_obj_t* scr_receipt_result   = nullptr;
+static lv_obj_t* scr_receipt_prep         = nullptr;
+static lv_obj_t* scr_receipt_countdown    = nullptr;
+static lv_obj_t* scr_receipt_photo_taken  = nullptr;
+static lv_obj_t* scr_receipt_result       = nullptr;
 static lv_obj_t* scr_recipe_prompt    = nullptr;
 static lv_obj_t* scr_recipe_result    = nullptr;
 static lv_obj_t* scr_menu             = nullptr;
@@ -294,6 +296,11 @@ static String    to_pending_name;
 static lv_obj_t* rec_title_lbl = nullptr;
 static lv_obj_t* rec_time_lbl  = nullptr;
 static lv_obj_t* rec_steps_obj = nullptr;
+
+// Receipt countdown
+static lv_obj_t*   countdown_num_lbl = nullptr;
+static lv_timer_t* countdown_timer   = nullptr;
+static int         countdown_value   = 3;
 
 // Receipt result
 struct ReceiptItem { String name; bool needs_refrig; bool checked; };
@@ -392,6 +399,10 @@ static void buildScan();
 static void buildVeggieResult();
 static void buildTakeOutResult();
 static void buildReceiptPrep();
+static void buildReceiptCountdown();
+static void buildReceiptPhotoTaken();
+static void startReceiptCountdown();
+static void stopReceiptCountdown();
 static void buildReceiptResult();
 static void buildRecipePrompt();
 static void buildRecipeResult();
@@ -935,6 +946,36 @@ static void populateTakeOutRecipes(const String& dish_names) {
     }
 }
 
+// "Loading recipes..." placeholder while waiting for the LLM list to arrive.
+static void showTakeOutRecipesLoading() {
+    if (!to_recipe_list) return;
+    lv_obj_clean(to_recipe_list);
+    lv_obj_t* lbl = makeLabel(to_recipe_list, "Loading recipes...",
+                               &lv_font_montserrat_16, COLOR_SUBTEXT);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
+}
+
+// Ask main to generate a dish list for the just-detected veggie + fridge.
+// Result arrives on the data char as a recipe_list event (see onData).
+static void requestTakeOutRecipes(const String& trigger) {
+    String cmd = "{\"cmd\":\"get_recipe_list\",\"trigger\":\"";
+    cmd += trigger;
+    cmd += "\",\"ingredients\":[";
+    bool first = true;
+    // Include the trigger so the LLM knows what's on the counter, plus the
+    // fridge contents (skip dup if already inventoried).
+    cmd += '"'; cmd += trigger; cmd += '"'; first = false;
+    for (auto& f : gFridge) {
+        if (f.equalsIgnoreCase(trigger)) continue;
+        if (!first) cmd += ',';
+        cmd += '"'; cmd += f; cmd += '"';
+        first = false;
+    }
+    cmd += "]}";
+    espnowSendCmd(cmd);
+}
+
 static void showTakeOutResult(const String& label, float conf) {
     to_pending_name = label;
 
@@ -949,12 +990,9 @@ static void showTakeOutResult(const String& label, float conf) {
     }
     if (to_remove_btn) lv_obj_clear_flag(to_remove_btn, LV_OBJ_FLAG_HIDDEN);
 
-    // Build recipe suggestions from fridge contents (static list for now;
-    // replace with BLE-received list when XIAO sends them)
-    String suggestions = "";
-    // The XIAO should send these; we populate from the veggie_result payload's
-    // "dishes" field if present, otherwise show a placeholder.
-    populateTakeOutRecipes(suggestions.length() ? suggestions : "Waiting for suggestions");
+    // Show the loading state in the right panel, then kick off the LLM call.
+    showTakeOutRecipesLoading();
+    requestTakeOutRecipes(label);
 
     gUiState = UI_VEGGIE_RESULT;   // reuse state slot
     switchScreen(scr_takeout_result);
@@ -967,14 +1005,15 @@ static void showTakeOutResult(const String& label, float conf) {
 // ============================================================================
 
 static void onPrepCaptureCb(lv_event_t*) {
-    espnowSendCmd("{\"cmd\":\"capture_receipt\"}");
-    if (scan_status_label) lv_label_set_text(scan_status_label, "Taking photo");
-    gUiState = UI_SCANNING;
-    startScanAnim();
-    switchScreen(scr_scan);
+    // Run the 3-2-1 countdown first; capture_receipt is only sent when the
+    // countdown reaches 0 (see countdownTickCb).
+    switchScreen(scr_receipt_countdown);
+    startReceiptCountdown();
 }
 
 static void onPrepCancelCb(lv_event_t*) {
+    // If we landed here from review (Retake), main is holding a frame — drop it.
+    espnowSendCmd("{\"cmd\":\"cancel\"}");
     gUiState = UI_SUBMODE_SELECT;
     switchScreen(scr_submode);
 }
@@ -1027,6 +1066,128 @@ static void buildReceiptPrep() {
 }
 
 // ============================================================================
+//                       SCREEN: receipt countdown (3,2,1)
+//   Visual countdown that runs *before* the camera fires. capture_receipt is
+//   only sent once the countdown hits 0, then we switch to the photo-taken
+//   transition screen.
+// ============================================================================
+
+static void stopReceiptCountdown() {
+    if (countdown_timer) { lv_timer_del(countdown_timer); countdown_timer = nullptr; }
+}
+
+static void countdownTickCb(lv_timer_t* t) {
+    countdown_value--;
+    if (countdown_value > 0) {
+        char b[4]; snprintf(b, sizeof(b), "%d", countdown_value);
+        if (countdown_num_lbl) lv_label_set_text(countdown_num_lbl, b);
+        return;
+    }
+    // Done — fire the camera and transition.
+    stopReceiptCountdown();
+    espnowSendCmd("{\"cmd\":\"capture_receipt\"}");
+    switchScreen(scr_receipt_photo_taken);
+}
+
+static void startReceiptCountdown() {
+    countdown_value = 3;
+    if (countdown_num_lbl) lv_label_set_text(countdown_num_lbl, "3");
+    stopReceiptCountdown();
+    countdown_timer = lv_timer_create(countdownTickCb, 1000, NULL);
+}
+
+static void onCountdownCancelCb(lv_event_t*) {
+    stopReceiptCountdown();
+    switchScreen(scr_receipt_prep);
+}
+
+static void buildReceiptCountdown() {
+    scr_receipt_countdown = makeScreen();
+
+    // Header
+    lv_obj_t* h = lv_obj_create(scr_receipt_countdown);
+    lv_obj_set_size(h, 800, 56); lv_obj_set_pos(h, 0, 0);
+    lv_obj_set_style_bg_color(h, COLOR_CARD, 0);
+    lv_obj_set_style_radius(h, 0, 0);
+    lv_obj_set_style_border_side(h, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(h, COLOR_ACCENT2, 0);
+    lv_obj_set_style_border_width(h, 2, 0);
+    lv_obj_clear_flag(h, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* ht = makeLabel(h, LV_SYMBOL_FILE " Get Ready",
+                              &lv_font_montserrat_22, COLOR_ACCENT2);
+    lv_obj_align(ht, LV_ALIGN_LEFT_MID, 20, 0);
+
+    // Upper hint
+    lv_obj_t* hint = makeLabel(scr_receipt_countdown,
+        "Hold the receipt steady",
+        &lv_font_montserrat_20, COLOR_TEXT);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, -120);
+
+    // "Capturing in" sub-label
+    lv_obj_t* sub = makeLabel(scr_receipt_countdown, "Capturing in",
+                               &lv_font_montserrat_16, COLOR_SUBTEXT);
+    lv_obj_align(sub, LV_ALIGN_CENTER, 0, -50);
+
+    // Big countdown number (scaled up via transform for more impact)
+    countdown_num_lbl = makeLabel(scr_receipt_countdown, "3",
+                                    &lv_font_montserrat_48, COLOR_ACCENT2);
+    lv_obj_set_style_transform_zoom(countdown_num_lbl, 512, 0);  // 2x
+    lv_obj_set_style_transform_pivot_x(countdown_num_lbl, 0, 0);
+    lv_obj_set_style_transform_pivot_y(countdown_num_lbl, 0, 0);
+    lv_obj_align(countdown_num_lbl, LV_ALIGN_CENTER, 0, 30);
+
+    // Cancel button (in case the user changes their mind in 3 s)
+    lv_obj_t* cancel = makeButton(scr_receipt_countdown, "Cancel",
+                                   lv_color_hex(0x444444), onCountdownCancelCb);
+    lv_obj_set_size(cancel, 180, 50);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_MID, 0, -20);
+}
+
+// ============================================================================
+//                  SCREEN: photo taken (post-capture transition)
+//   Shown after the countdown fires capture_receipt, until the result data
+//   arrives. Tells the user the camera has done its bit and they can put the
+//   receipt down while the OCR call runs.
+// ============================================================================
+
+static void buildReceiptPhotoTaken() {
+    scr_receipt_photo_taken = makeScreen();
+
+    // Header
+    lv_obj_t* h = lv_obj_create(scr_receipt_photo_taken);
+    lv_obj_set_size(h, 800, 56); lv_obj_set_pos(h, 0, 0);
+    lv_obj_set_style_bg_color(h, COLOR_CARD, 0);
+    lv_obj_set_style_radius(h, 0, 0);
+    lv_obj_set_style_border_side(h, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(h, COLOR_ACCENT, 0);
+    lv_obj_set_style_border_width(h, 2, 0);
+    lv_obj_clear_flag(h, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* ht = makeLabel(h, LV_SYMBOL_OK " Photo Taken",
+                              &lv_font_montserrat_22, COLOR_ACCENT);
+    lv_obj_align(ht, LV_ALIGN_LEFT_MID, 20, 0);
+
+    // Big checkmark
+    lv_obj_t* icon = makeLabel(scr_receipt_photo_taken, LV_SYMBOL_OK,
+                                &lv_font_montserrat_48, COLOR_ACCENT);
+    lv_obj_set_style_transform_zoom(icon, 384, 0);   // 1.5x
+    lv_obj_set_style_transform_pivot_x(icon, 0, 0);
+    lv_obj_set_style_transform_pivot_y(icon, 0, 0);
+    lv_obj_align(icon, LV_ALIGN_CENTER, 0, -70);
+
+    // Headline
+    lv_obj_t* title = makeLabel(scr_receipt_photo_taken, "Photo Taken",
+                                 &lv_font_montserrat_28, COLOR_TEXT);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 20);
+
+    // Sub-message
+    lv_obj_t* sub = makeLabel(scr_receipt_photo_taken,
+        "You can put the receipt down\nReading receipt...",
+        &lv_font_montserrat_18, COLOR_SUBTEXT);
+    lv_obj_set_style_text_align(sub, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 90);
+}
+
+// ============================================================================
 //                          SCREEN: receipt result
 // ============================================================================
 
@@ -1046,11 +1207,9 @@ static void rcpConfirmCb(lv_event_t*) {
 static void rcpCancelCb(lv_event_t*) { gUiState = UI_ACTION_SELECT; switchScreen(scr_action); }
 
 static void rcpRetakeCb(lv_event_t*) {
-    espnowSendCmd("{\"cmd\":\"capture_receipt\"}");
-    if (scan_status_label) lv_label_set_text(scan_status_label, "Capturing photo");
-    gUiState = UI_SCANNING;
-    startScanAnim();
-    switchScreen(scr_scan);
+    // Send the user back to the prep screen so they can reposition the
+    // receipt and tap Capture again, instead of firing the camera immediately.
+    switchScreen(scr_receipt_prep);
 }
 
 static void buildReceiptResult() {
@@ -1359,8 +1518,9 @@ static void onEvent(const String& json) {
         lvgl_port_lock(-1);
         if (scan_status_label) {
             const char* msg =
-                evt == "receipt_capturing" ? "Capturing photo" :
-                evt == "receipt_uploading" ? "Reading receipt" : "Looking for ingredients";
+                evt == "receipt_capturing" ? "Reading receipt\nPhoto taken — you can put it down" :
+                evt == "receipt_uploading" ? "Reading receipt\nPlease wait"                       :
+                                             "Looking for ingredients";
             lv_label_set_text(scan_status_label, msg);
         }
         lvgl_port_unlock();
@@ -1490,6 +1650,11 @@ static void onData(const String& payload) {
     stopScanAnim();
     if (evt == "receipt_result")     showReceiptResult(payload);
     else if (evt == "recipe_result") showRecipeResult(payload);
+    else if (evt == "recipe_list") {
+        // Pipe-joined dish list from main; populate the take-out panel.
+        String dishes = jsonStrField(payload, "dishes");
+        populateTakeOutRecipes(dishes);
+    }
     lvgl_port_unlock();
 }
 
@@ -1526,6 +1691,8 @@ void setup() {
     buildVeggieResult();
     buildTakeOutResult();
     buildReceiptPrep();
+    buildReceiptCountdown();
+    buildReceiptPhotoTaken();
     buildReceiptResult();
     buildRecipePrompt();
     buildRecipeResult();
