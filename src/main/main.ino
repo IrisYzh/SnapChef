@@ -899,9 +899,9 @@ static String extractBoolField(const String& json, const char* key) {
 }
 
 // Walks "items":[...] in a receipt response and streams the first `maxItems`
-// out as one single-frame BLE event each:
+// out as one single-frame ESP-NOW event each:
 //   {"evt":"receipt_item","idx":k,"total":N,"name":"…","needs_refrigeration":bool}
-// Each event is well under the 244-byte single-notify ceiling, so this path
+// Each event fits well under the 250-byte ESP-NOW frame ceiling, so this path
 // avoids the chunked-data reassembler entirely. Returns the number of items
 // emitted.
 static int sendReceiptTestStream(const String& resp, int maxItems) {
@@ -1099,9 +1099,9 @@ static void runReceiptCapture() {
         gState = STATE_IDLE; return;
     }
 
-    // Heavy WiFi/TLS just finished; give BLE coex a generous moment to drain
-    // its queue before pushing notifications. Without this, the first
-    // notifications after upload are silently dropped on the radio.
+    // Heavy WiFi/TLS just finished; give the radio a generous moment to
+    // settle before we start pushing ESP-NOW frames. Without this, the first
+    // frames after upload are silently dropped.
     delay(500);
 
     // DEBUG: stream the first 10 items as individual single-frame events.
@@ -1189,7 +1189,7 @@ void loop() {
     // 0. Service the debug preview HTTP server.
     if (WiFi.status() == WL_CONNECTED) gDebugServer.handleClient();
 
-    // 1. Pull pending command (filled by BLE write callback).
+    // 1. Pull pending command (filled by the ESP-NOW recv callback).
     if (gCmdPending) {
         String c = gPendingCmd;
         gCmdPending = false;

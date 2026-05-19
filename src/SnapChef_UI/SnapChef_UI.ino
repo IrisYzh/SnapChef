@@ -1484,7 +1484,7 @@ static void rebuildMenu() {
 }
 
 // ============================================================================
-//                       BLE event / data handlers
+//                       ESP-NOW event / data handlers
 // ============================================================================
 
 static String jsonStrField(const String& json, const char* key) {
