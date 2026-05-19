@@ -65,9 +65,14 @@ static const char* WIFI_PASS = "45yVuUeU7At7gnxt";
 // --- Backend ---
 static const char* API_URL     = "https://snapchef-production.up.railway.app/receipts/analyze";
 static const char* HEALTHZ_URL = "https://snapchef-production.up.railway.app/healthz";
+// Recipe endpoints (Claude-backed on the backend; change BASE_URL if you move
+// these to a different host). Same X-API-Key as receipts.
+static const char* RECIPES_LIST_URL  = "https://snapchef-production.up.railway.app/recipes/list";
+static const char* RECIPES_STEPS_URL = "https://snapchef-production.up.railway.app/recipes/steps";
 static const char* API_KEY     = "snapchefasdfghjkl123456789";
 static const char* BOUNDARY    = "----snapchef32boundary";
 static const int   HTTP_TIMEOUT_MS = 20000;
+static const int   RECIPE_HTTP_TIMEOUT_MS = 30000;   // LLM generation can be slow
 
 // --- HC-SR04 ---
 static const int   TRIG_PIN     = 2;
@@ -123,6 +128,8 @@ static volatile MainState gState = STATE_IDLE;
 static volatile bool gCancelRequested = false;
 static String  gPendingPurpose = "in";           // for veggie scan
 static String  gPendingIngredientsJson = "[]";   // for recipe
+static String  gPendingTrigger = "";             // for recipe list (just-removed item)
+static String  gPendingDish    = "";             // for recipe steps (chosen dish)
 
 // --- TFLM ---
 static uint8_t* tensor_arena = nullptr;
@@ -164,6 +171,8 @@ static void resetSmoothing();
 static void runVeggieScan();
 static void runReceiptCapture();
 static void runRecipe();
+static void runRecipeList();
+static void runRecipeSteps();
 static void sendEvent(const String& json);
 static void sendData(const String& payload);
 
@@ -522,6 +531,147 @@ static String buildRecipeMock(const String& ingredientsJson) {
     json += "\"ingredients\":" + ingredientsJson;
     json += "}";
     return json;
+}
+
+// Generic HTTPS JSON POST. Returns the response body on 200, empty on err.
+// On error, fills errCode/errMsg for a payload back to the display.
+static String httpPostJson(const char* url, const String& body,
+                            int timeout_ms, String& errCode, String& errMsg) {
+    errCode = ""; errMsg = "";
+    if (!connectWiFi()) { errCode = "wifi"; errMsg = "WiFi unavailable"; return ""; }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(timeout_ms);
+    if (!http.begin(client, url)) { errCode = "http_begin"; errMsg = "begin() failed"; return ""; }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-API-Key", API_KEY);
+
+    unsigned long t0 = millis();
+    int code = http.POST((uint8_t*)body.c_str(), body.length());
+    unsigned long dt = millis() - t0;
+    String resp = http.getString();
+    http.end();
+
+    Serial.printf("[http] POST %s -> %d in %lu ms (%u bytes)\n",
+                  url, code, dt, (unsigned)resp.length());
+    if (code != 200) {
+        errCode = "http_" + String(code);
+        errMsg  = resp.length() ? resp : "HTTP error";
+        return "";
+    }
+    return resp;
+}
+
+// Trim wrapping whitespace/quotes from a dish name.
+static String trimQuoted(const String& s) {
+    int a = 0, b = (int)s.length();
+    while (a < b && (s[a] == ' ' || s[a] == '\t')) a++;
+    while (b > a && (s[b-1] == ' ' || s[b-1] == '\t')) b--;
+    return s.substring(a, b);
+}
+
+// Pull a string array out of {"dishes":["A","B","C"]} into a pipe-joined
+// "A|B|C". Tolerant — uses simple scanning so we don't need a JSON lib.
+static String dishesFromJson(const String& json) {
+    String pat = "\"dishes\":[";
+    int i = json.indexOf(pat); if (i < 0) return "";
+    i += pat.length();
+    int end = json.indexOf(']', i); if (end < 0) end = json.length();
+    String out;
+    while (i < end) {
+        int q1 = json.indexOf('"', i); if (q1 < 0 || q1 >= end) break;
+        int q2 = json.indexOf('"', q1 + 1); if (q2 < 0 || q2 > end) break;
+        String name = trimQuoted(json.substring(q1 + 1, q2));
+        if (name.length()) { if (out.length()) out += '|'; out += name; }
+        i = q2 + 1;
+    }
+    return out;
+}
+
+// POST to /recipes/list — backend should return {"dishes":["A","B","C"]}.
+// We forward dishes as a pipe-joined list inside a small JSON envelope so
+// the display can splice them straight into populateTakeOutRecipes().
+static void runRecipeList() {
+    gState = STATE_RECIPE;
+    Serial.printf("[recipe_list] trigger=%s fridge=%s\n",
+                  gPendingTrigger.c_str(), gPendingIngredientsJson.c_str());
+
+    String body = "{\"trigger\":\"";
+    body += gPendingTrigger;
+    body += "\",\"fridge\":";
+    body += gPendingIngredientsJson;
+    body += "}";
+
+    String errCode, errMsg;
+    String resp = httpPostJson(RECIPES_LIST_URL, body, RECIPE_HTTP_TIMEOUT_MS,
+                                errCode, errMsg);
+
+    String dishes;
+    if (resp.length()) dishes = dishesFromJson(resp);
+
+    if (!dishes.length()) {
+        // Fall back to a tiny mock so the UI still has something to show
+        // when the backend isn't ready / call failed.
+        Serial.printf("[recipe_list] fallback (err=%s)\n", errCode.c_str());
+        if (gPendingTrigger.indexOf("Carrot") >= 0)
+            dishes = "Honey Glazed Carrots|Carrot Soup|Roasted Carrots";
+        else if (gPendingTrigger.indexOf("Tomato") >= 0)
+            dishes = "Caprese Salad|Tomato Omelette|Pasta Pomodoro";
+        else if (gPendingTrigger.indexOf("Eggplant") >= 0)
+            dishes = "Eggplant Parmesan|Baba Ganoush|Ratatouille";
+        else
+            dishes = "Stir-Fried Medley|Quick Soup|Veggie Wrap";
+    }
+
+    String payload = "{\"evt\":\"recipe_list\",\"dishes\":\"";
+    payload += dishes;
+    payload += "\"}";
+    sendEvent("{\"evt\":\"recipe_list\"}");
+    sendData(payload);
+    gState = STATE_IDLE;
+}
+
+// POST to /recipes/steps — backend should return
+//   {"title":"...","time_min":15,"steps":["...","..."]}.
+// We add the evt envelope and forward to the display.
+static void runRecipeSteps() {
+    gState = STATE_RECIPE;
+    Serial.printf("[recipe_steps] dish=%s fridge=%s\n",
+                  gPendingDish.c_str(), gPendingIngredientsJson.c_str());
+
+    String body = "{\"dish\":\"";
+    body += gPendingDish;
+    body += "\",\"fridge\":";
+    body += gPendingIngredientsJson;
+    body += "}";
+
+    String errCode, errMsg;
+    String resp = httpPostJson(RECIPES_STEPS_URL, body, RECIPE_HTTP_TIMEOUT_MS,
+                                errCode, errMsg);
+
+    String payload;
+    if (resp.length()) {
+        // Backend returns body without evt envelope; splice one in.
+        // The response starts with '{'; insert "evt":"recipe_result", right after.
+        int brace = resp.indexOf('{');
+        if (brace >= 0) {
+            payload  = resp.substring(0, brace + 1);
+            payload += "\"evt\":\"recipe_result\",";
+            payload += resp.substring(brace + 1);
+        }
+    }
+    if (payload.length() == 0) {
+        // Fall back to the existing mock-builder when the API fails so the
+        // UI still gets a recipe.
+        Serial.printf("[recipe_steps] fallback (err=%s)\n", errCode.c_str());
+        payload = buildRecipeMock(gPendingIngredientsJson);
+    }
+
+    sendEvent("{\"evt\":\"recipe_result\"}");
+    sendData(payload);
+    gState = STATE_IDLE;
 }
 
 // ============================================================================
@@ -902,8 +1052,17 @@ static void handleCmd(const String& cmd) {
     } else if (name == "capture_receipt") {
         runReceiptCapture();
     } else if (name == "get_recipe") {
+        // Legacy mock path; not used by the new UI flow.
         gPendingIngredientsJson = extractArrayField(cmd, "ingredients");
         runRecipe();
+    } else if (name == "get_recipe_list") {
+        gPendingTrigger         = extractStringField(cmd, "trigger");
+        gPendingIngredientsJson = extractArrayField(cmd, "ingredients");
+        runRecipeList();
+    } else if (name == "get_recipe_steps") {
+        gPendingDish            = extractStringField(cmd, "dish");
+        gPendingIngredientsJson = extractArrayField(cmd, "ingredients");
+        runRecipeSteps();
     } else {
         Serial.printf("[cmd] unknown: %s\n", name.c_str());
     }
