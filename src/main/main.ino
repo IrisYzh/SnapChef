@@ -1,11 +1,11 @@
 /*
  * SnapChef — Main controller (XIAO ESP32S3 Sense)
  *
- * Hosts the camera, HC-SR04 ultrasonic, WiFi, and a NimBLE GATT server.
- * The display device (Waveshare 4.3" Touch LCD) connects over BLE and
- * drives the UI; this firmware is "headless".
+ * Hosts the camera, HC-SR04 ultrasonic, WiFi, and an ESP-NOW peer link to
+ * the display device (Waveshare 4.3" Touch LCD). This firmware is "headless"
+ * — all UI lives on the display board, which talks to us over ESP-NOW.
  *
- * Capabilities exposed over BLE:
+ * Capabilities exposed over ESP-NOW (tag 'E' / 'D' events, tag 'C' commands):
  *   1. Idle proximity wake — emits {"evt":"proximity_wake"} when an object
  *      is detected within ~10 cm of the HC-SR04.
  *   2. Veggie classification — on {"cmd":"start_veggie_scan"} runs the
@@ -14,7 +14,7 @@
  *      after 20 s.
  *   3. Receipt scan — on {"cmd":"capture_receipt"} switches the camera to
  *      UXGA, captures a single JPEG, POSTs it to /receipts/analyze, and
- *      streams the raw JSON response back on the data characteristic.
+ *      streams the parsed items back as individual 'E' events.
  *   4. Recipe lookup — on {"cmd":"get_recipe","ingredients":[...]} returns a
  *      hard-coded mock recipe (Carrot/Eggplant/generic) — backend not built.
  *
@@ -29,8 +29,7 @@
  *
  * Required libraries:
  *   - TensorFlowLite_ESP32
- *   - NimBLE-Arduino (h2zero) — small heap footprint vs built-in BLE stack
- *   - WiFi / WiFiClientSecure / HTTPClient (built in)
+ *   - WiFi / WiFiClientSecure / HTTPClient / esp_now (built in)
  */
 
 #include <Arduino.h>
@@ -45,7 +44,8 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 
-#include <NimBLEDevice.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -53,7 +53,7 @@
 
 #include "model_data.h"
 #include "labels.h"
-#include "snapchef_ble.h"
+#include "snapchef_espnow.h"
 
 // ============================================================================
 //                                  CONFIG
@@ -143,14 +143,12 @@ static int   lock_candidate_idx   = -1;
 static int   lock_streak          = 0;
 static int   release_streak       = 0;
 
-// --- BLE ---
-static NimBLEServer*         bleServer    = nullptr;
-static NimBLECharacteristic* chrCmd       = nullptr;
-static NimBLECharacteristic* chrEvt       = nullptr;
-static NimBLECharacteristic* chrData      = nullptr;
-static volatile bool         bleConnected = false;
+// --- ESP-NOW link to the display ---
+static const uint8_t BROADCAST_MAC[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+static uint8_t       gPeerMac[6]      = {0};
+static volatile bool gPeerLinked      = false;
 
-// --- Pending commands queue (filled in BLE callback, drained in loop()) ---
+// --- Pending commands queue (filled in ESP-NOW recv callback, drained in loop()) ---
 static volatile bool gCmdPending = false;
 static String gPendingCmd;
 
@@ -598,26 +596,50 @@ static float readDistanceCm() {
 }
 
 // ============================================================================
-//                                BLE: helpers
+//                              ESP-NOW: helpers
 // ============================================================================
 
+static bool addPeer(const uint8_t* mac) {
+    if (esp_now_is_peer_exist(mac)) return true;
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, mac, 6);
+    p.channel = 0;            // 0 = use the current STA channel
+    p.ifidx   = WIFI_IF_STA;
+    p.encrypt = false;
+    esp_err_t err = esp_now_add_peer(&p);
+    if (err != ESP_OK) {
+        Serial.printf("[espnow] add_peer failed: %d\n", err);
+        return false;
+    }
+    return true;
+}
+
+static void espnowSendRaw(const uint8_t* mac, const uint8_t* buf, size_t len) {
+    esp_err_t err = esp_now_send(mac, buf, len);
+    if (err != ESP_OK) Serial.printf("[espnow] send err: %d\n", err);
+}
+
 static void sendEvent(const String& json) {
-    if (!chrEvt || !bleConnected) return;
-    chrEvt->setValue((uint8_t*)json.c_str(), json.length());
-    chrEvt->notify();
-    Serial.printf("[ble:evt] %s\n", json.c_str());
+    if (!gPeerLinked) return;
+    // Tag byte + JSON body. Events are kept short by design (well under the
+    // 250 B ESP-NOW ceiling), so single-frame transmission is fine.
+    std::vector<uint8_t> buf(json.length() + 1);
+    buf[0] = SNAPCHEF_MSG_EVT;
+    memcpy(buf.data() + 1, json.c_str(), json.length());
+    espnowSendRaw(gPeerMac, buf.data(), buf.size());
+    Serial.printf("[espnow:evt] %s\n", json.c_str());
 }
 
 // Splits `payload` (raw text, typically JSON) into framed chunks of the form
 //   "<seq>/<total>|<frag>"
-// and sends each as a single notify on the data characteristic. Display
-// reassembles by parsing the header.
+// and sends each as one tagged ESP-NOW frame. Display reassembles by parsing
+// the header.
 static void sendData(const String& payload) {
-    if (!chrData || !bleConnected) return;
+    if (!gPeerLinked) return;
     const int frag = SNAPCHEF_DATA_FRAG_MAX;
     int total = (payload.length() + frag - 1) / frag;
     if (total == 0) total = 1;
-    Serial.printf("[ble:data] sending %d bytes in %d frames\n",
+    Serial.printf("[espnow:data] sending %d bytes in %d frames\n",
                   (int)payload.length(), total);
     for (int i = 0; i < total; i++) {
         String chunk;
@@ -628,36 +650,46 @@ static void sendData(const String& payload) {
         chunk += '|';
         chunk += payload.substring(i * frag,
                                     min((int)payload.length(), (i + 1) * frag));
-        chrData->setValue((uint8_t*)chunk.c_str(), chunk.length());
-        chrData->notify();
-        delay(20);   // give stack room to push between fragments
+        std::vector<uint8_t> buf(chunk.length() + 1);
+        buf[0] = SNAPCHEF_MSG_DATA;
+        memcpy(buf.data() + 1, chunk.c_str(), chunk.length());
+        espnowSendRaw(gPeerMac, buf.data(), buf.size());
+        delay(20);   // pace consecutive sends so the WiFi TX queue can drain
     }
 }
 
 // ============================================================================
-//                          BLE: server callbacks
+//                          ESP-NOW: receive callback + init
 // ============================================================================
 
-// NimBLE-Arduino v2.x callback signatures (v1 had no NimBLEConnInfo arg).
-class ServerCb : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer* /*srv*/, NimBLEConnInfo& /*info*/) override {
-        bleConnected = true;
-        Serial.println("[ble] client connected");
-        // Suspend advertising while connected (single-peer design).
-    }
-    void onDisconnect(NimBLEServer* /*srv*/, NimBLEConnInfo& /*info*/, int /*reason*/) override {
-        bleConnected = false;
-        Serial.println("[ble] client disconnected, restarting adv");
-        gCancelRequested = true;       // abort any in-flight scan
-        NimBLEDevice::startAdvertising();
-    }
-};
+static void onEspNowRecv(const esp_now_recv_info_t* info,
+                         const uint8_t* data, int len) {
+    if (len < 1) return;
+    char tag = (char)data[0];
+    const uint8_t* mac = info->src_addr;
 
-class CmdCb : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& /*info*/) override {
-        std::string v = c->getValue();
-        String s(v.c_str());
-        Serial.printf("[ble:cmd] %s\n", s.c_str());
+    if (tag == SNAPCHEF_MSG_HELLO) {
+        // Display has appeared. Bind it as our unicast peer and ACK with READY.
+        memcpy(gPeerMac, mac, 6);
+        addPeer(gPeerMac);
+        gPeerLinked = true;
+        Serial.printf("[espnow] peer linked %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+        uint8_t ready = SNAPCHEF_MSG_READY;
+        espnowSendRaw(gPeerMac, &ready, 1);
+        return;
+    }
+
+    if (tag == SNAPCHEF_MSG_CMD) {
+        String s; s.reserve(len);
+        for (int i = 1; i < len; i++) s += (char)data[i];
+        Serial.printf("[espnow:cmd] %s\n", s.c_str());
+        // Re-bind peer in case display restarted with a new MAC.
+        if (!gPeerLinked || memcmp(mac, gPeerMac, 6) != 0) {
+            memcpy(gPeerMac, mac, 6);
+            addPeer(gPeerMac);
+            gPeerLinked = true;
+        }
         // Cancel is handled inline; everything else queued for the main loop.
         if (s.indexOf("\"cancel\"") >= 0) {
             gCancelRequested = true;
@@ -665,36 +697,27 @@ class CmdCb : public NimBLECharacteristicCallbacks {
         }
         gPendingCmd = s;
         gCmdPending = true;
+        return;
     }
-};
+}
 
-static void initBle() {
-    NimBLEDevice::init(SNAPCHEF_BLE_NAME);
-    NimBLEDevice::setMTU(247);
-    NimBLEDevice::setPower(9);   // +9 dBm; v2 takes raw int8_t
+static void initEspNow() {
+    // WiFi STA mode is required for ESP-NOW; main has already attempted
+    // WiFi.begin() in setup(), which puts us in STA. The ESP-NOW socket
+    // inherits the current STA channel — if WiFi connect failed we end up
+    // on whatever channel the radio defaulted to (typically 1), and the
+    // display's SSID-scan discovery falls back to channel 1 to match.
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[espnow] init failed");
+        return;
+    }
+    esp_now_register_recv_cb(onEspNowRecv);
+    addPeer(BROADCAST_MAC);    // so broadcast sends are also legal
 
-    bleServer = NimBLEDevice::createServer();
-    bleServer->setCallbacks(new ServerCb());
-
-    NimBLEService* svc = bleServer->createService(SNAPCHEF_SVC_UUID);
-
-    chrCmd = svc->createCharacteristic(SNAPCHEF_CHR_CMD_UUID,
-                                       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
-    chrCmd->setCallbacks(new CmdCb());
-
-    chrEvt = svc->createCharacteristic(SNAPCHEF_CHR_EVT_UUID,
-                                       NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
-    chrData = svc->createCharacteristic(SNAPCHEF_CHR_DATA_UUID,
-                                        NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
-
-    svc->start();
-
-    NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-    adv->addServiceUUID(SNAPCHEF_SVC_UUID);
-    adv->setName(SNAPCHEF_BLE_NAME);
-    adv->enableScanResponse(true);   // v2 rename of setScanResponse
-    adv->start();
-    Serial.println("[ble] advertising");
+    uint8_t mac[6];
+    WiFi.macAddress(mac);
+    Serial.printf("[espnow] ready, mac=%02X:%02X:%02X:%02X:%02X:%02X chan=%d\n",
+                  mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], WiFi.channel());
 }
 
 // ============================================================================
@@ -999,7 +1022,7 @@ void setup() {
         initDebugServer();
     }
 
-    initBle();
+    initEspNow();
     Serial.println("ready");
 }
 
@@ -1019,7 +1042,7 @@ void loop() {
     static unsigned long lastWake = 0;
     if (millis() - lastProx >= PROXIMITY_INTERVAL_MS) {
         lastProx = millis();
-        if (gState == STATE_IDLE && bleConnected) {
+        if (gState == STATE_IDLE && gPeerLinked) {
             float d = readDistanceCm();
             if (d > 0 && d < DETECT_CM &&
                 millis() - lastWake > PROXIMITY_COOLDOWN_MS) {

@@ -11,12 +11,13 @@
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
 
-#include <NimBLEDevice.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
 
-#include "snapchef_ble.h"
+#include "snapchef_espnow.h"
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -89,17 +90,14 @@ static void inventoryRemoveAt(int idx) {
 }
 
 // ============================================================================
-//                              BLE CLIENT
+//                              ESP-NOW CLIENT
 // ============================================================================
 
-static NimBLEClient*               bleCli       = nullptr;
-static NimBLERemoteCharacteristic* bleCmd       = nullptr;
-static NimBLERemoteCharacteristic* bleEvt       = nullptr;
-static NimBLERemoteCharacteristic* bleData      = nullptr;
-static volatile bool               bleConnected = false;
-static volatile bool               bleShouldScan = true;
-static NimBLEAddress               bleTargetAddr;
-static volatile bool               bleHasTarget = false;
+static const uint8_t BROADCAST_MAC[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+static uint8_t       gMainMac[6]      = {0};
+static volatile bool peerLinked       = false;
+static unsigned long gLastHelloMs     = 0;
+static int           gEspNowChannel   = SNAPCHEF_ESPNOW_CHANNEL_FALLBACK;
 
 static String dataAccum;
 static int    dataExpectedSeq   = 1;
@@ -114,30 +112,58 @@ static void resetDataAccum() {
     dataExpectedTotal = 0;
 }
 
-static void evtNotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+static bool addPeer(const uint8_t* mac, int channel) {
+    if (esp_now_is_peer_exist(mac)) return true;
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, mac, 6);
+    p.channel = channel;
+    p.ifidx   = WIFI_IF_STA;
+    p.encrypt = false;
+    esp_err_t err = esp_now_add_peer(&p);
+    if (err != ESP_OK) {
+        Serial.printf("[espnow] add_peer failed: %d\n", err);
+        return false;
+    }
+    return true;
+}
+
+static void espnowSendRaw(const uint8_t* mac, const uint8_t* buf, size_t len) {
+    esp_err_t err = esp_now_send(mac, buf, len);
+    if (err != ESP_OK) Serial.printf("[espnow] send err: %d\n", err);
+}
+
+static void espnowSendCmd(const String& json) {
+    if (!peerLinked) { Serial.println("[espnow] cmd dropped, not linked"); return; }
+    std::vector<uint8_t> buf(json.length() + 1);
+    buf[0] = SNAPCHEF_MSG_CMD;
+    memcpy(buf.data() + 1, json.c_str(), json.length());
+    espnowSendRaw(gMainMac, buf.data(), buf.size());
+}
+
+static void handleEvtFrame(const uint8_t* data, int len) {
     String s; s.reserve(len);
-    for (size_t i = 0; i < len; i++) s += (char)data[i];
-    Serial.printf("[ble:evt<-] %s\n", s.c_str());
+    for (int i = 0; i < len; i++) s += (char)data[i];
+    Serial.printf("[espnow:evt<-] %s\n", s.c_str());
     onEvent(s);
 }
 
-static void dataNotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
+static void handleDataFrame(const uint8_t* data, int len) {
     int sep1 = -1, sep2 = -1;
-    for (size_t i = 0; i < len; i++) {
+    for (int i = 0; i < len; i++) {
         if (data[i] == '/' && sep1 < 0) sep1 = i;
         else if (data[i] == '|' && sep1 >= 0) { sep2 = i; break; }
     }
     if (sep1 < 0 || sep2 < 0) {
-        Serial.printf("[ble:data] bad framing, len=%d\n", (int)len);
+        Serial.printf("[espnow:data] bad framing, len=%d\n", len);
         return;
     }
     int seq   = atoi((const char*)data);
     int total = atoi((const char*)data + sep1 + 1);
-    Serial.printf("[ble:data] seq=%d/%d len=%d\n", seq, total, (int)len);
+    Serial.printf("[espnow:data] seq=%d/%d len=%d\n", seq, total, len);
     if (seq == 1) {
         resetDataAccum();
         dataExpectedTotal = total;
-        // Pre-reserve to avoid heap thrash on large payloads (JPEGs).
+        // Pre-reserve to avoid heap thrash on large payloads.
         dataAccum.reserve((size_t)total * SNAPCHEF_DATA_FRAG_MAX);
     }
     if (seq != dataExpectedSeq || total != dataExpectedTotal) {
@@ -149,69 +175,68 @@ static void dataNotifyCb(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
     if (seq == total) { onData(dataAccum); resetDataAccum(); }
 }
 
-class CliCb : public NimBLEClientCallbacks {
-    void onConnect(NimBLEClient*) override { Serial.println("[ble] connected"); }
-    void onDisconnect(NimBLEClient*, int) override {
-        bleConnected = false; bleShouldScan = true;
-        Serial.println("[ble] disconnected");
-    }
-};
+static void onEspNowRecv(const esp_now_recv_info_t* info,
+                         const uint8_t* data, int len) {
+    if (len < 1) return;
+    char tag = (char)data[0];
+    const uint8_t* mac = info->src_addr;
+    const uint8_t* p   = data + 1;
+    int            pl  = len  - 1;
 
-class ScanCb : public NimBLEScanCallbacks {
-    void onResult(const NimBLEAdvertisedDevice* dev) override {
-        if (dev->isAdvertisingService(NimBLEUUID(SNAPCHEF_SVC_UUID))) {
-            NimBLEDevice::getScan()->stop();
-            bleTargetAddr = dev->getAddress();
-            bleHasTarget  = true;
-        }
-    }
-    void onScanEnd(const NimBLEScanResults&, int) override {
-        if (!bleConnected && !bleHasTarget) bleShouldScan = true;
-    }
-};
-
-static void bleSendCmd(const String& json) {
-    if (!bleConnected || !bleCmd) return;
-    bleCmd->writeValue((uint8_t*)json.c_str(), json.length(), false);
-}
-
-static bool bleConnectTo(const NimBLEAddress& addr) {
-    if (!bleCli) { bleCli = NimBLEDevice::createClient(); bleCli->setClientCallbacks(new CliCb(), false); }
-    if (!bleCli->connect(addr)) return false;
-    NimBLERemoteService* svc = bleCli->getService(SNAPCHEF_SVC_UUID);
-    if (!svc) { bleCli->disconnect(); return false; }
-    bleCmd  = svc->getCharacteristic(SNAPCHEF_CHR_CMD_UUID);
-    bleEvt  = svc->getCharacteristic(SNAPCHEF_CHR_EVT_UUID);
-    bleData = svc->getCharacteristic(SNAPCHEF_CHR_DATA_UUID);
-    if (!bleCmd || !bleEvt || !bleData) { bleCli->disconnect(); return false; }
-    if (bleEvt->canNotify())  bleEvt->subscribe(true,  evtNotifyCb);
-    if (bleData->canNotify()) bleData->subscribe(true, dataNotifyCb);
-    bleConnected = true;
-    return true;
-}
-
-static void bleInit() {
-    NimBLEDevice::init("SnapChef-Display");
-    NimBLEDevice::setMTU(247);
-    NimBLEDevice::setPower(9);
-    NimBLEScan* scan = NimBLEDevice::getScan();
-    scan->setScanCallbacks(new ScanCb(), false);
-    scan->setActiveScan(true);
-    scan->setInterval(80);
-    scan->setWindow(40);
-}
-
-static void bleTick() {
-    if (bleConnected) return;
-    if (bleHasTarget) {
-        NimBLEAddress addr = bleTargetAddr; bleHasTarget = false;
-        if (!bleConnectTo(addr)) bleShouldScan = true;
+    if (tag == SNAPCHEF_MSG_READY) {
+        memcpy(gMainMac, mac, 6);
+        addPeer(gMainMac, gEspNowChannel);
+        peerLinked = true;
+        Serial.printf("[espnow] linked to main %02X:%02X:%02X:%02X:%02X:%02X\n",
+                      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
         return;
     }
-    if (bleShouldScan) {
-        bleShouldScan = false;
-        NimBLEDevice::getScan()->start(3000, false, true);
+    if (tag == SNAPCHEF_MSG_EVT)  { handleEvtFrame(p, pl);  return; }
+    if (tag == SNAPCHEF_MSG_DATA) { handleDataFrame(p, pl); return; }
+}
+
+// Scans the air for the AP main joins so we can lock our radio to the same
+// channel as main's ESP-NOW socket. Returns -1 if the SSID isn't visible.
+static int findMainChannel() {
+    int n = WiFi.scanNetworks(false, false, false, 300, 0);
+    int ch = -1;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) == SNAPCHEF_PEER_WIFI_SSID) { ch = WiFi.channel(i); break; }
     }
+    WiFi.scanDelete();
+    return ch;
+}
+
+static void espnowInit() {
+    // Display never associates with the AP, but we need STA mode so ESP-NOW
+    // has a radio interface to bind to. The channel must be set explicitly
+    // because there's no AP connection to fix it for us.
+    WiFi.mode(WIFI_STA);
+    delay(50);
+
+    int ch = findMainChannel();
+    if (ch < 1) ch = SNAPCHEF_ESPNOW_CHANNEL_FALLBACK;
+    gEspNowChannel = ch;
+    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[espnow] channel=%d\n", ch);
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("[espnow] init failed"); return;
+    }
+    esp_now_register_recv_cb(onEspNowRecv);
+    addPeer(BROADCAST_MAC, ch);
+
+    uint8_t mac[6]; WiFi.macAddress(mac);
+    Serial.printf("[espnow] ready, mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+}
+
+static void espnowTick() {
+    if (peerLinked) return;
+    if (millis() - gLastHelloMs < 500) return;
+    gLastHelloMs = millis();
+    uint8_t hello = SNAPCHEF_MSG_HELLO;
+    espnowSendRaw(BROADCAST_MAC, &hello, 1);
 }
 
 // ============================================================================
@@ -432,7 +457,7 @@ static void buildIdle() {
 static void updateConnectionDot() {
     if (!connection_dot) return;
     lv_obj_set_style_bg_color(connection_dot,
-        bleConnected ? COLOR_OK : COLOR_SUBTEXT, 0);
+        peerLinked ? COLOR_OK : COLOR_SUBTEXT, 0);
 }
 
 // ============================================================================
@@ -446,7 +471,7 @@ static void onActionBackCb(lv_event_t*)    { gUiState = UI_IDLE; switchScreen(sc
 static void onActionTakeOutCb(lv_event_t*) {
     gPurpose = "out"; gScanKind = "veggie";
     gUiState = UI_SCANNING;
-    bleSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
+    espnowSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
     if (scan_status_label) lv_label_set_text(scan_status_label, "Show the ingredient to remove");
     startScanAnim();
     switchScreen(scr_scan);
@@ -503,7 +528,7 @@ static void buildAction() {
 
 static void onSubmodeVeggieCb(lv_event_t*) {
     gScanKind = "veggie"; gUiState = UI_SCANNING;
-    bleSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"in\"}");
+    espnowSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"in\"}");
     if (scan_status_label) lv_label_set_text(scan_status_label, "Hold the ingredient up to the camera");
     startScanAnim(); switchScreen(scr_scan);
 }
@@ -578,7 +603,7 @@ static void stopScanAnim() {
 }
 
 static void onScanCancelCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"cancel\"}");
+    espnowSendCmd("{\"cmd\":\"cancel\"}");
     stopScanAnim();
     gUiState = UI_ACTION_SELECT;
     switchScreen(scr_action);
@@ -658,10 +683,10 @@ static void showVeggieSuccessBox(const String& name) {
 
 static void vrRetryCb(lv_event_t*) {
     if (gPurpose == "out") {
-        bleSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
+        espnowSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
         if (scan_status_label) lv_label_set_text(scan_status_label, "Show the ingredient to remove");
     } else {
-        bleSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"in\"}");
+        espnowSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"in\"}");
         if (scan_status_label) lv_label_set_text(scan_status_label, "Hold the ingredient up to the camera");
     }
     gUiState = UI_SCANNING; startScanAnim(); switchScreen(scr_scan);
@@ -759,7 +784,7 @@ static void showVeggieResult(const String& label, float conf,
 
 static void toBackCb(lv_event_t*) { gUiState = UI_ACTION_SELECT; switchScreen(scr_action); }
 static void toRetryCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
+    espnowSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
     if (scan_status_label) lv_label_set_text(scan_status_label, "Show the ingredient to remove");
     gUiState = UI_SCANNING; startScanAnim(); switchScreen(scr_scan);
 }
@@ -786,7 +811,7 @@ static void toRecipeTapCb(lv_event_t* e) {
         if (!first) cmd += ','; cmd += '"'; cmd += f; cmd += '"'; first = false;
     }
     cmd += "]}";
-    bleSendCmd(cmd);
+    espnowSendCmd(cmd);
     if (scan_status_label) lv_label_set_text(scan_status_label, "Getting recipe steps");
     gUiState = UI_SCANNING; startScanAnim(); switchScreen(scr_scan);
 }
@@ -942,7 +967,7 @@ static void showTakeOutResult(const String& label, float conf) {
 // ============================================================================
 
 static void onPrepCaptureCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"capture_receipt\"}");
+    espnowSendCmd("{\"cmd\":\"capture_receipt\"}");
     if (scan_status_label) lv_label_set_text(scan_status_label, "Taking photo");
     gUiState = UI_SCANNING;
     startScanAnim();
@@ -1021,7 +1046,7 @@ static void rcpConfirmCb(lv_event_t*) {
 static void rcpCancelCb(lv_event_t*) { gUiState = UI_ACTION_SELECT; switchScreen(scr_action); }
 
 static void rcpRetakeCb(lv_event_t*) {
-    bleSendCmd("{\"cmd\":\"capture_receipt\"}");
+    espnowSendCmd("{\"cmd\":\"capture_receipt\"}");
     if (scan_status_label) lv_label_set_text(scan_status_label, "Capturing photo");
     gUiState = UI_SCANNING;
     startScanAnim();
@@ -1350,7 +1375,7 @@ static void onEvent(const String& json) {
         String dishes = jsonStrField(json, "dishes");
 
         // Stop the camera so it does not keep scanning after a result is shown
-        bleSendCmd("{\"cmd\":\"cancel\"}");
+        espnowSendCmd("{\"cmd\":\"cancel\"}");
 
         lvgl_port_lock(-1);
         stopScanAnim();
@@ -1366,7 +1391,7 @@ static void onEvent(const String& json) {
 
     if (evt == "veggie_unknown") {
         String purp = jsonStrField(json, "purpose");
-        bleSendCmd("{\"cmd\":\"cancel\"}");
+        espnowSendCmd("{\"cmd\":\"cancel\"}");
         lvgl_port_lock(-1);
         stopScanAnim();
         showVeggieResult("", 0.0f, purp, false);
@@ -1508,12 +1533,12 @@ void setup() {
     lv_scr_load(scr_idle);
     lvgl_port_unlock();
 
-    bleInit();
+    espnowInit();
     Serial.println("UI ready");
 }
 
 void loop() {
-    bleTick();
+    espnowTick();
     lvgl_port_lock(-1);
     updateConnectionDot();
     lvgl_port_unlock();
