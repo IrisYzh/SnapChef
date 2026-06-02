@@ -21,4 +21,4 @@ static const int SNAPCHEF_DATA_FRAG_MAX = 200;
 
 // Channel used when SSID isn't visible (e.g. main offline at display boot) —
 // must match the channel main ends up on for first-contact to succeed.
-static const int SNAPCHEF_ESPNOW_CHANNEL_FALLBACK = 1;
+static const int SNAPCHEF_ESPNOW_CHANNEL_FALLBACK = 11;
