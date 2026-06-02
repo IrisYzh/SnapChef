@@ -1514,13 +1514,15 @@ static void onEvent(const String& json) {
         return;
     }
 
-    if (evt == "veggie_scanning" || evt == "receipt_capturing" || evt == "receipt_uploading") {
+    if (evt == "veggie_scanning" || evt == "veggie_cloud_lookup" ||
+        evt == "receipt_capturing" || evt == "receipt_uploading") {
         lvgl_port_lock(-1);
         if (scan_status_label) {
             const char* msg =
-                evt == "receipt_capturing" ? "Reading receipt\nPhoto taken — you can put it down" :
-                evt == "receipt_uploading" ? "Reading receipt\nPlease wait"                       :
-                                             "Looking for ingredients";
+                evt == "receipt_capturing"  ? "Reading receipt\nPhoto taken — you can put it down" :
+                evt == "receipt_uploading"  ? "Reading receipt\nPlease wait"                       :
+                evt == "veggie_cloud_lookup"? "Checking online…\nPlease wait"                      :
+                                              "Looking for ingredients";
             lv_label_set_text(scan_status_label, msg);
         }
         lvgl_port_unlock();

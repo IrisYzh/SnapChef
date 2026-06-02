@@ -65,6 +65,7 @@ static const char* WIFI_PASS = "45yVuUeU7At7gnxt";
 
 // --- Backend ---
 static const char* API_URL     = "https://snapchef-backend-production.up.railway.app/receipts/analyze";
+static const char* PRODUCE_URL = "https://snapchef-backend-production.up.railway.app/produce/recognize";
 static const char* HEALTHZ_URL = "https://snapchef-backend-production.up.railway.app/healthz";
 // Recipe endpoints (Claude-backed on the backend; change BASE_URL if you move
 // these to a different host). Same X-API-Key as receipts.
@@ -84,12 +85,20 @@ static const unsigned long PROXIMITY_COOLDOWN_MS = 3000;
 
 // --- Veggie classifier (mirrors esp32_deploy_V6.ino) ---
 static const unsigned long INFERENCE_INTERVAL_MS = 500;
-static const unsigned long VEGGIE_TIMEOUT_MS     = 20000;
+// On-device scan window. If nothing locks in this time we fall back to the
+// cloud /produce/recognize endpoint, which has its own HTTP_TIMEOUT_MS budget.
+static const unsigned long VEGGIE_LOCAL_TIMEOUT_MS = 5000;
 static const int  IMG_W = 128, IMG_H = 128, IMG_C = 3;     // V4 model: 128x128
 static const int  TENSOR_ARENA_SIZE = 700 * 1024;          // ~(128/96)^2 of V3's 512KB
-static const float CONF_LOCK = 0.80f;
+static const float CONF_LOCK = 0.90f;
 static const int   LOCK_STREAK_NEEDED    = 3;
 static const int   RELEASE_STREAK_NEEDED = 3;
+// Highest-fidelity JPEG quality (lower = better) used for both full-res
+// captures — receipt OCR and cloud produce recognition. The camera DMA/JPEG
+// buffer is sized at init for this value, so the runtime up-shift to it never
+// overflows (see initCamera + captureJpegUXGA). Don't push below ~6 without
+// re-checking PSRAM headroom and the backend's ~3 MB raw-image cap.
+static const int   CAPTURE_JPEG_QUALITY = 6;
 
 // --- Camera pins (XIAO ESP32S3 Sense FFC) ---
 #define PWDN_GPIO_NUM   -1
@@ -172,8 +181,10 @@ static uint32_t   gLastJpegSeq = 0;
 static bool initCamera();
 static bool initModel();
 static bool captureAndPreprocess(int8_t* dst);
+static uint8_t* captureJpegUXGA(int jpegQuality, size_t& outLen);
 static void resetSmoothing();
 static void runVeggieScan();
+static bool runCloudProduceFallback(const String& purpose);
 static void runReceiptCapture();
 static void runRecipe();
 static void runRecipeList();
@@ -212,7 +223,12 @@ static bool initCamera() {
     // below for the veggie streaming path; runtime set_framesize() can then
     // safely upshift back to UXGA without FB-OVF.
     config.frame_size   = FRAMESIZE_UXGA;
-    config.jpeg_quality = 12;
+    // Size the JPEG buffer for the highest-fidelity capture we'll ever take
+    // (receipt + cloud produce both use CAPTURE_JPEG_QUALITY). Lower quality
+    // numbers => larger frames; sizing for it here means a runtime
+    // set_quality() to it can't overflow the buffer (FB-OVF). The veggie
+    // streaming path uses a larger number (q10), which is smaller and safe.
+    config.jpeg_quality = CAPTURE_JPEG_QUALITY;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -486,13 +502,17 @@ static void healthzSelfCheck() {
 }
 
 // ============================================================================
-//                              RECEIPT UPLOAD
+//                              IMAGE UPLOAD
 // ============================================================================
 
-// Returns the full HTTP response body (raw JSON) on 200, empty string on err.
-// On error also fills `errCode` / `errMsg` for an event payload.
-static String uploadReceipt(const uint8_t* jpeg, size_t jpeg_len,
-                            String& errCode, String& errMsg) {
+// Shared multipart/form-data JPEG upload. Builds a single `image` field POST,
+// returns the full HTTP response body (raw JSON) on 200, empty string on err.
+// On error also fills `errCode` / `errMsg` for an event payload. `tag` is just a
+// serial-log prefix; `filename` is the multipart filename.
+static String uploadImageMultipart(const char* url, const char* filename,
+                                   const char* tag,
+                                   const uint8_t* jpeg, size_t jpeg_len,
+                                   String& errCode, String& errMsg) {
     errCode = ""; errMsg = "";
     if (!connectWiFi()) {
         errCode = "wifi"; errMsg = "WiFi unavailable";
@@ -500,7 +520,7 @@ static String uploadReceipt(const uint8_t* jpeg, size_t jpeg_len,
     }
 
     String prefix = String("--") + BOUNDARY + "\r\n"
-                    "Content-Disposition: form-data; name=\"image\"; filename=\"receipt.jpg\"\r\n"
+                    "Content-Disposition: form-data; name=\"image\"; filename=\"" + filename + "\"\r\n"
                     "Content-Type: image/jpeg\r\n\r\n";
     String suffix = String("\r\n--") + BOUNDARY + "--\r\n";
     size_t total = prefix.length() + jpeg_len + suffix.length();
@@ -517,7 +537,7 @@ static String uploadReceipt(const uint8_t* jpeg, size_t jpeg_len,
     client.setInsecure();
     HTTPClient http;
     http.setTimeout(HTTP_TIMEOUT_MS);
-    if (!http.begin(client, API_URL)) {
+    if (!http.begin(client, url)) {
         free(body);
         errCode = "http_begin"; errMsg = "begin() failed";
         return "";
@@ -532,16 +552,31 @@ static String uploadReceipt(const uint8_t* jpeg, size_t jpeg_len,
     http.end();
     free(body);
 
-    Serial.printf("[receipt] HTTP %d in %lu ms, %u bytes\n",
-                  code, dt, (unsigned)resp.length());
-    Serial.print("[receipt] body: ");
-    Serial.println(resp);
+    Serial.printf("[%s] HTTP %d in %lu ms, %u bytes\n",
+                  tag, code, dt, (unsigned)resp.length());
+    Serial.printf("[%s] body: %s\n", tag, resp.c_str());
     if (code != 200) {
         errCode = "http_" + String(code);
         errMsg  = resp.length() ? resp : "HTTP error";
         return "";
     }
     return resp;
+}
+
+// Returns the full HTTP response body (raw JSON) on 200, empty string on err.
+// On error also fills `errCode` / `errMsg` for an event payload.
+static String uploadReceipt(const uint8_t* jpeg, size_t jpeg_len,
+                            String& errCode, String& errMsg) {
+    return uploadImageMultipart(API_URL, "receipt.jpg", "receipt",
+                                jpeg, jpeg_len, errCode, errMsg);
+}
+
+// Uploads a single produce JPEG to /produce/recognize. Same contract as
+// uploadReceipt; the response is {name, raw_name, confidence}.
+static String uploadProduce(const uint8_t* jpeg, size_t jpeg_len,
+                            String& errCode, String& errMsg) {
+    return uploadImageMultipart(PRODUCE_URL, "produce.jpg", "produce",
+                                jpeg, jpeg_len, errCode, errMsg);
 }
 
 // ============================================================================
@@ -898,6 +933,19 @@ static String extractBoolField(const String& json, const char* key) {
     return "false";
 }
 
+// Parses a numeric field (e.g. "confidence":0.98). Returns `dflt` when the key
+// is missing or its value is `null` — matches the /produce/recognize contract
+// where confidence is null on an Uncertain result.
+static float extractNumberField(const String& json, const char* key, float dflt) {
+    String pat = String("\"") + key + "\":";
+    int i = json.indexOf(pat);
+    if (i < 0) return dflt;
+    i += pat.length();
+    while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
+    if (json.substring(i, i + 4) == "null") return dflt;
+    return json.substring(i).toFloat();
+}
+
 // Walks "items":[...] in a receipt response and streams the first `maxItems`
 // out as one single-frame ESP-NOW event each:
 //   {"evt":"receipt_item","idx":k,"total":N,"name":"…","needs_refrigeration":bool}
@@ -987,6 +1035,55 @@ static String extractArrayField(const String& json, const char* key) {
     return "[]";
 }
 
+// Cloud fallback when the on-device classifier can't confirm: snap one
+// max-quality JPEG, POST it to /produce/recognize, and emit a veggie_result on a
+// confident hit. Returns true iff a veggie_result was sent; on any miss
+// (Uncertain, HTTP/WiFi error, capture/oom) it returns false so the caller can
+// fall through to veggie_unknown.
+static bool runCloudProduceFallback(const String& purpose) {
+    sendEvent(String("{\"evt\":\"veggie_cloud_lookup\",\"purpose\":\"") +
+              purpose + "\"}");
+
+    size_t   jlen = 0;
+    uint8_t* jbuf = captureJpegUXGA(CAPTURE_JPEG_QUALITY, jlen);
+    if (!jbuf) {
+        Serial.println("[produce] capture failed");
+        return false;
+    }
+
+    String errCode, errMsg;
+    String resp = uploadProduce(jbuf, jlen, errCode, errMsg);
+    heap_caps_free(jbuf);
+
+    // Heavy WiFi/TLS just finished; let the radio settle before the next
+    // ESP-NOW frame (sent by us on success, or by the caller's veggie_unknown
+    // on failure), or it gets silently dropped (same as the receipt path).
+    delay(500);
+
+    if (resp.length() == 0) {
+        Serial.printf("[produce] upload failed: %s %s\n",
+                      errCode.c_str(), errMsg.c_str());
+        return false;
+    }
+
+    String name = extractStringField(resp, "name");
+    if (name.length() == 0 || name == "Uncertain") {
+        Serial.printf("[produce] uncertain (name='%s')\n", name.c_str());
+        return false;
+    }
+    float conf = extractNumberField(resp, "confidence", 0.0f);
+
+    String j = "{";
+    j += "\"evt\":\"veggie_result\",";
+    j += "\"label\":\""; j += name; j += "\",";
+    j += "\"confidence\":"; j += String(conf, 3); j += ",";
+    j += "\"source\":\"cloud\",";
+    j += "\"purpose\":\""; j += purpose; j += "\"";
+    j += "}";
+    sendEvent(j);
+    return true;
+}
+
 static void runVeggieScan() {
     gState = STATE_VEGGIE_SCAN;
     gCancelRequested = false;
@@ -999,7 +1096,7 @@ static void runVeggieScan() {
     int   foundIdx  = -1;
     float foundConf = 0.0f;
 
-    while (millis() - t0 < VEGGIE_TIMEOUT_MS) {
+    while (millis() - t0 < VEGGIE_LOCAL_TIMEOUT_MS) {
         if (gCancelRequested) {
             Serial.println("[veggie] cancelled");
             sendEvent("{\"evt\":\"veggie_cancelled\"}");
@@ -1024,11 +1121,51 @@ static void runVeggieScan() {
         j += "\"purpose\":\""; j += gPendingPurpose; j += "\"";
         j += "}";
         sendEvent(j);
+    } else if (!gCancelRequested && runCloudProduceFallback(gPendingPurpose)) {
+        // veggie_result already sent by the fallback.
     } else {
         sendEvent(String("{\"evt\":\"veggie_unknown\",\"purpose\":\"") +
                   gPendingPurpose + "\"}");
     }
     gState = STATE_IDLE;
+}
+
+// Captures one UXGA JPEG at the given quality into a fresh PSRAM buffer (the
+// caller frees it with heap_caps_free). Returns nullptr on failure with outLen
+// untouched. Up-shifts the sensor to UXGA, drains stale frames, copies the
+// frame out, then restores QVGA q10 for veggie streaming. The buffer was sized
+// at init for CAPTURE_JPEG_QUALITY, so any quality >= that is overflow-safe.
+// Also caches the JPEG for the debug preview server.
+static uint8_t* captureJpegUXGA(int jpegQuality, size_t& outLen) {
+    outLen = 0;
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) return nullptr;
+
+    s->set_framesize(s, FRAMESIZE_UXGA);
+    s->set_quality(s, jpegQuality);
+    drainCameraFrames(3);
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    uint8_t* jbuf = nullptr;
+    if (fb) {
+        Serial.printf("[capture] UXGA q%d -> %ux%u %u bytes\n",
+                      jpegQuality, (unsigned)fb->width, (unsigned)fb->height,
+                      (unsigned)fb->len);
+        jbuf = (uint8_t*)heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM);
+        if (jbuf) {
+            memcpy(jbuf, fb->buf, fb->len);
+            outLen = fb->len;
+            debugStoreReceiptJpeg(jbuf, fb->len);   // browser preview
+        }
+        esp_camera_fb_return(fb);
+    }
+
+    // Restore sensor for veggie streaming.
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    s->set_quality(s, 10);
+    drainCameraFrames(2);
+
+    return jbuf;
 }
 
 // One-shot receipt flow: capture UXGA → upload to /receipts/analyze →
@@ -1037,45 +1174,11 @@ static void runReceiptCapture() {
     gState = STATE_RECEIPT_CAPTURE;
     sendEvent("{\"evt\":\"receipt_capturing\"}");
 
-    sensor_t* s = esp_camera_sensor_get();
-    if (!s) {
-        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"sensor\",\"msg\":\"no sensor\"}");
-        gState = STATE_IDLE; return;
-    }
-
-    // Upshift to UXGA for max OCR fidelity. DMA buffer was sized for UXGA at
-    // init, so this shift is safe (no FB-OVF).
-    s->set_framesize(s, FRAMESIZE_UXGA);
-    s->set_quality(s, 12);
-    drainCameraFrames(3);
-
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
+    // Max fidelity for OCR; buffer is sized for CAPTURE_JPEG_QUALITY at init.
+    size_t   jlen = 0;
+    uint8_t* jbuf = captureJpegUXGA(CAPTURE_JPEG_QUALITY, jlen);
+    if (!jbuf) {
         sendEvent("{\"evt\":\"receipt_error\",\"code\":\"capture\",\"msg\":\"capture failed\"}");
-        s->set_framesize(s, FRAMESIZE_QVGA);
-        s->set_quality(s, 10);
-        drainCameraFrames(2);
-        gState = STATE_IDLE; return;
-    }
-    Serial.printf("[receipt] captured %ux%u %u bytes (UXGA)\n",
-                  (unsigned)fb->width, (unsigned)fb->height, (unsigned)fb->len);
-
-    size_t   jlen = fb->len;
-    uint8_t* jbuf = (uint8_t*)heap_caps_malloc(jlen, MALLOC_CAP_SPIRAM);
-    bool copied = false;
-    if (jbuf) { memcpy(jbuf, fb->buf, jlen); copied = true; }
-    // Cache a copy for the browser preview server before returning fb.
-    if (copied) debugStoreReceiptJpeg(jbuf, jlen);
-    esp_camera_fb_return(fb);
-
-    // Restore sensor for veggie streaming before doing the slow upload.
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 10);
-    drainCameraFrames(2);
-
-    if (!copied) {
-        if (jbuf) heap_caps_free(jbuf);
-        sendEvent("{\"evt\":\"receipt_error\",\"code\":\"oom\",\"msg\":\"jpeg copy failed\"}");
         gState = STATE_IDLE; return;
     }
 

@@ -4,7 +4,7 @@
 
 | 项 | 值 |
 |---|---|
-| Base URL | `https://snapchef-backend-production.up.railway.app` |
+| Base URL | `https://snapchef-production.up.railway.app` |
 | 协议 | HTTPS（TLS 1.2+，证书由 Let's Encrypt 签发）|
 | 认证方式 | HTTP Header `X-API-Key` |
 | 内容类型 | `multipart/form-data` |
@@ -20,6 +20,7 @@
 |---|---|---|---|
 | GET | `/healthz` | 健康检查，连通性自检 | 否 |
 | POST | `/receipts/analyze` | 上传小票图片，返回结构化商品清单 | 是 |
+| POST | `/produce/recognize` | 上传果蔬图片，返回英文名称（非果蔬返回 `Uncertain`） | 是 |
 
 ---
 
@@ -58,7 +59,7 @@
 
 **示例 curl**：
 ```bash
-curl -X POST https://snapchef-backend-production.up.railway.app/receipts/analyze \
+curl -X POST https://snapchef-production.up.railway.app/receipts/analyze \
   -H "X-API-Key: <your-key>" \
   -F "image=@receipt.jpg;type=image/jpeg"
 ```
@@ -163,6 +164,81 @@ curl -X POST https://snapchef-backend-production.up.railway.app/receipts/analyze
 
 ---
 
+## 3. 果蔬识别 `POST /produce/recognize`
+
+上传一张果蔬照片，后端先调用百度果蔬识别，再用 Claude 把中文名翻译成英文返回。**若图片不是果蔬，返回 `name = "Uncertain"`。**
+
+### 请求
+
+**Headers**：
+| Header | 必填 | 说明 |
+|---|---|---|
+| `X-API-Key` | ✅ | 固定 token，后端比对 |
+| `Content-Type` | ✅ | `multipart/form-data; boundary=...`（HTTP 库会自动加） |
+
+**Body**：multipart 表单，**只有一个字段**：
+
+| 字段名 | 类型 | 必填 | 约束 |
+|---|---|---|---|
+| `image` | 文件 | ✅ | `image/jpeg` 或 `image/png`；不能为空；原图 ≤ **8 MB**，且 base64 编码后 ≤ **4 MB**（即原图约 ≤ 3 MB）|
+
+> ⚠️ 字段名必须是 `image`（同 `/receipts/analyze`）。百度对编码后大小限制 4MB，所以单张果蔬图建议控制在 3MB 以内。
+
+**示例 curl**：
+```bash
+curl -X POST https://snapchef-production.up.railway.app/produce/recognize \
+  -H "X-API-Key: <your-key>" \
+  -F "image=@tomato.jpg;type=image/jpeg"
+```
+
+### 响应 `200 OK`
+
+识别为果蔬时：
+```json
+{
+  "name": "Tomato",
+  "raw_name": "西红柿",
+  "confidence": 0.98
+}
+```
+
+判定为非果蔬 / 未识别 / 置信度过低时：
+```json
+{
+  "name": "Uncertain",
+  "raw_name": null,
+  "confidence": null
+}
+```
+
+### 响应字段详解
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `name` | string | 英文果蔬名（首字母大写、单数），或固定字符串 `"Uncertain"` |
+| `raw_name` | string \| null | 百度返回的中文名；`Uncertain` 时为 `null`，仅用于调试 |
+| `confidence` | number \| null | 百度置信度 0~1；`Uncertain` 时为 `null` |
+
+> 设备端逻辑：先判断 `name == "Uncertain"`，是则提示"无法识别，请对准果蔬重拍"；否则直接展示 `name`。
+
+**`Uncertain` 触发条件**（任一满足，**不会**调用 Claude 翻译）：
+- 百度未识别出任何结果
+- 最高项被百度标记为"非果蔬食材"
+- 最高项置信度低于阈值（默认 `0.5`，由后端 `BAIDU_PRODUCE_MIN_SCORE` 配置）
+
+### 错误响应
+
+| HTTP | 触发条件 | 设备处理建议 |
+|---|---|---|
+| **400** | 文件类型不是 jpeg/png；文件为空；原图超 8MB；或编码后超百度 4MB 上限 | 提示用户重拍 / 压缩图像 |
+| **401** | `X-API-Key` 错误 | 致命错误，不应重试 |
+| **422** | `image` 字段缺失 | 固件 bug，检查字段名 |
+| **502** | 百度识别调用失败，或 Claude 翻译失败 | 提示网络问题，可重试 1-2 次 |
+
+> 注意：与 `/receipts/analyze` 不同，本接口翻译失败会返回 **502**（没有合理的降级英文名），不会返回 200。
+
+---
+
 ## 性能与超时建议
 
 | 指标 | 数值 |
@@ -183,7 +259,7 @@ curl -X POST https://snapchef-backend-production.up.railway.app/receipts/analyze
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 
-#define API_URL "https://snapchef-backend-production.up.railway.app/receipts/analyze"
+#define API_URL "https://snapchef-production.up.railway.app/receipts/analyze"
 #define API_KEY "<your-key>"
 #define BOUNDARY "----snapchef32boundary"
 
@@ -246,6 +322,8 @@ esp_err_t upload_receipt(const uint8_t *jpeg, size_t jpeg_len, char *resp_buf, s
 - [ ] 故意传 `image/bmp` → 400
 - [ ] 模拟网络断开 → 客户端超时不超过 20s，UI 能恢复
 - [ ] 返回 `classification_warning != null` 时，UI 仍正常显示商品（只是没分类）
+- [ ] `/produce/recognize` 上传一张果蔬图 → 200，`name` 为英文名
+- [ ] `/produce/recognize` 上传非果蔬图（如人脸/桌子）→ 200，`name == "Uncertain"`
 
 ---
 
