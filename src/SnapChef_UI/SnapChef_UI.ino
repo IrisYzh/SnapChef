@@ -7,6 +7,8 @@
 
 #include <Arduino.h>
 #include <vector>
+#include <algorithm>
+#include <strings.h>
 #include <esp_display_panel.hpp>
 #include <lvgl.h>
 #include "lvgl_v8_port.h"
@@ -16,6 +18,8 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "snapchef_espnow.h"
 
@@ -36,51 +40,108 @@ using namespace esp_panel::board;
 //                              INVENTORY (NVS)
 // ============================================================================
 
+// One fridge entry. `seq` is a persisted monotonic counter — the chronological
+// key used for sort order and "remove the oldest duplicate" (never collides,
+// survives reboot, works even before the clock is synced). `epoch` is the real
+// UTC add time (0 if the clock wasn't synced yet) and is used only for display.
+struct FridgeItem { String name; uint32_t seq; uint32_t epoch; };
+
 static Preferences gPrefs;
-static std::vector<String> gFridge;
+static std::vector<FridgeItem> gFridge;
+static uint32_t gNextSeq = 1;
+
+// Current UTC seconds once the main board has relayed time (see onEvent
+// "time_sync"); 0 until then. Defined here so inventoryAdd can stamp entries.
+static uint32_t nowEpoch() {
+    time_t t = time(nullptr);
+    return (t > 1700000000) ? (uint32_t)t : 0;   // ~2023-11; guards unsynced clock
+}
+
+// Sort by name (case-insensitive), then seq (chronological). Keeping gFridge
+// sorted means list screens can render in order and index directly into it.
+static void inventorySort() {
+    std::sort(gFridge.begin(), gFridge.end(),
+              [](const FridgeItem& a, const FridgeItem& b) {
+        int c = strcasecmp(a.name.c_str(), b.name.c_str());
+        if (c != 0) return c < 0;
+        return a.seq < b.seq;
+    });
+}
 
 static void inventoryLoad() {
     gFridge.clear();
+    gNextSeq = 1;
     gPrefs.begin("snapchef", true);
     String s = gPrefs.getString("inv", "");
+    gNextSeq = gPrefs.getUInt("seq", 1);
     gPrefs.end();
     int start = 0;
     while (start < (int)s.length()) {
         int sep = s.indexOf('|', start);
         if (sep < 0) sep = s.length();
         String item = s.substring(start, sep);
-        item.trim();
-        if (item.length()) gFridge.push_back(item);
         start = sep + 1;
+        if (!item.length()) continue;
+        // Fields within an item are separated by US (\x1f): name, seq, epoch.
+        // A token with no \x1f is a legacy name-only entry.
+        FridgeItem fi; fi.seq = 0; fi.epoch = 0;
+        int f1 = item.indexOf('\x1f');
+        if (f1 < 0) {
+            fi.name = item; fi.name.trim();
+            fi.seq = gNextSeq++;            // assign a fresh chronological key
+        } else {
+            fi.name = item.substring(0, f1);
+            int f2 = item.indexOf('\x1f', f1 + 1);
+            if (f2 < 0) f2 = item.length();
+            fi.seq   = (uint32_t)strtoul(item.substring(f1 + 1, f2).c_str(), nullptr, 10);
+            fi.epoch = (f2 < (int)item.length())
+                       ? (uint32_t)strtoul(item.substring(f2 + 1).c_str(), nullptr, 10) : 0;
+        }
+        if (fi.name.length()) {
+            if (fi.seq >= gNextSeq) gNextSeq = fi.seq + 1;
+            gFridge.push_back(fi);
+        }
     }
+    inventorySort();
 }
 
 static void inventorySave() {
+    inventorySort();
     String s;
     for (size_t i = 0; i < gFridge.size(); i++) {
         if (i) s += '|';
-        s += gFridge[i];
+        s += gFridge[i].name;
+        s += '\x1f'; s += String(gFridge[i].seq);
+        s += '\x1f'; s += String(gFridge[i].epoch);
     }
     gPrefs.begin("snapchef", false);
     gPrefs.putString("inv", s);
+    gPrefs.putUInt("seq", gNextSeq);
     gPrefs.end();
 }
 
 static void inventoryAdd(const String& name) {
     if (name.length() == 0) return;
-    gFridge.push_back(name);
+    FridgeItem fi;
+    fi.name  = name;
+    fi.seq   = gNextSeq++;
+    fi.epoch = nowEpoch();
+    gFridge.push_back(fi);
     inventorySave();
 }
 
+// Removes the OLDEST (smallest seq) entry whose name matches case-insensitively.
 static bool inventoryRemove(const String& name) {
+    int best = -1;
     for (size_t i = 0; i < gFridge.size(); i++) {
-        if (gFridge[i].equalsIgnoreCase(name)) {
-            gFridge.erase(gFridge.begin() + i);
-            inventorySave();
-            return true;
+        if (gFridge[i].name.equalsIgnoreCase(name)) {
+            if (best < 0 || gFridge[i].seq < gFridge[best].seq) best = (int)i;
         }
     }
-    return false;
+    if (best < 0) return false;
+    gFridge.erase(gFridge.begin() + best);
+    inventorySave();
+    return true;
 }
 
 static void inventoryRemoveAt(int idx) {
@@ -265,6 +326,9 @@ static lv_obj_t* scr_receipt_result       = nullptr;
 static lv_obj_t* scr_recipe_prompt    = nullptr;
 static lv_obj_t* scr_recipe_result    = nullptr;
 static lv_obj_t* scr_menu             = nullptr;
+static lv_obj_t* scr_takeout_submode  = nullptr;
+static lv_obj_t* scr_takeout_pick     = nullptr;
+static lv_obj_t* takeout_pick_list    = nullptr;
 
 static lv_obj_t*  scan_status_label = nullptr;
 static lv_obj_t*  scan_label_dots   = nullptr;
@@ -296,6 +360,9 @@ static String    to_pending_name;
 static lv_obj_t* rec_title_lbl = nullptr;
 static lv_obj_t* rec_time_lbl  = nullptr;
 static lv_obj_t* rec_steps_obj = nullptr;
+static lv_obj_t* rec_uses_cap  = nullptr;   // caption above the uses/missing chips
+static lv_obj_t* rec_uses_obj  = nullptr;   // chip container (used + missing)
+static std::vector<String> rec_used_items;  // backs the removable-chip callbacks
 
 // Receipt countdown
 static lv_obj_t*   countdown_num_lbl = nullptr;
@@ -303,7 +370,7 @@ static lv_timer_t* countdown_timer   = nullptr;
 static int         countdown_value   = 3;
 
 // Receipt result
-struct ReceiptItem { String name; bool needs_refrig; bool checked; };
+struct ReceiptItem { String name; String normalized; bool needs_refrig; bool checked; };
 static std::vector<ReceiptItem> rcp_items;
 static lv_obj_t* rcp_list_obj = nullptr;
 
@@ -408,6 +475,9 @@ static void buildRecipePrompt();
 static void buildRecipeResult();
 static void buildMenu();
 static void rebuildMenu();
+static void buildTakeOutSubmode();
+static void buildTakeOutPick();
+static void rebuildTakeOutPick();
 static void startScanAnim();
 static void stopScanAnim();
 static void showVeggieResult(const String&, float, const String&, bool);
@@ -479,7 +549,14 @@ static void onActionPutInCb(lv_event_t*)   { gPurpose = "in";  gUiState = UI_SUB
 static void onActionMenuCb(lv_event_t*)    { gUiState = UI_MENU; rebuildMenu(); switchScreen(scr_menu); }
 static void onActionBackCb(lv_event_t*)    { gUiState = UI_IDLE; switchScreen(scr_idle); }
 
+// Take Out now opens a sub-mode: scan-to-recognize OR pick-from-list.
 static void onActionTakeOutCb(lv_event_t*) {
+    gUiState = UI_SUBMODE_SELECT;
+    switchScreen(scr_takeout_submode);
+}
+
+// Start the camera-recognition take-out (the original behaviour).
+static void toModeScanCb(lv_event_t*) {
     gPurpose = "out"; gScanKind = "veggie";
     gUiState = UI_SCANNING;
     espnowSendCmd("{\"cmd\":\"start_veggie_scan\",\"purpose\":\"out\"}");
@@ -819,7 +896,7 @@ static void toRecipeTapCb(lv_event_t* e) {
     cmd += name; cmd += "\",\"ingredients\":[";
     bool first = true;
     for (auto& f : gFridge) {
-        if (!first) cmd += ','; cmd += '"'; cmd += f; cmd += '"'; first = false;
+        if (!first) cmd += ','; cmd += '"'; cmd += f.name; cmd += '"'; first = false;
     }
     cmd += "]}";
     espnowSendCmd(cmd);
@@ -967,21 +1044,26 @@ static void requestTakeOutRecipes(const String& trigger) {
     // fridge contents (skip dup if already inventoried).
     cmd += '"'; cmd += trigger; cmd += '"'; first = false;
     for (auto& f : gFridge) {
-        if (f.equalsIgnoreCase(trigger)) continue;
+        if (f.name.equalsIgnoreCase(trigger)) continue;
         if (!first) cmd += ',';
-        cmd += '"'; cmd += f; cmd += '"';
+        cmd += '"'; cmd += f.name; cmd += '"';
         first = false;
     }
     cmd += "]}";
     espnowSendCmd(cmd);
 }
 
+// conf < 0 means the item was picked manually from the fridge list (no scan).
 static void showTakeOutResult(const String& label, float conf) {
     to_pending_name = label;
 
     lv_label_set_text(to_name_lbl, label.c_str());
-    char b[48]; snprintf(b, sizeof(b), "Confidence: %.0f%%", conf * 100.0f);
-    lv_label_set_text(to_conf_lbl, b);
+    if (conf < 0) {
+        lv_label_set_text(to_conf_lbl, "Selected from fridge");
+    } else {
+        char b[48]; snprintf(b, sizeof(b), "Confidence: %.0f%%", conf * 100.0f);
+        lv_label_set_text(to_conf_lbl, b);
+    }
 
     // Reset status and Remove button for a fresh result
     if (to_status_lbl) {
@@ -996,6 +1078,151 @@ static void showTakeOutResult(const String& label, float conf) {
 
     gUiState = UI_VEGGIE_RESULT;   // reuse state slot
     switchScreen(scr_takeout_result);
+}
+
+// ============================================================================
+//                 SCREEN: take-out sub-mode (scan vs pick) + pick list
+// ============================================================================
+
+static void toModePickCb(lv_event_t*) {
+    gUiState = UI_MENU;            // reuse a state slot
+    rebuildTakeOutPick();
+    switchScreen(scr_takeout_pick);
+}
+
+static void toSubmodeBackCb(lv_event_t*) {
+    gUiState = UI_ACTION_SELECT;
+    switchScreen(scr_action);
+}
+
+static void buildTakeOutSubmode() {
+    scr_takeout_submode = makeScreen();
+    makeHeader(scr_takeout_submode, "Take Out of Fridge",
+               "How do you want to choose?", COLOR_ACCENT2);
+
+    const int cw = 270, ch = 290, gap = 40, cy = 96;
+    const int sx = (800 - cw * 2 - gap) / 2;
+
+    struct { const char* icon; const char* title; const char* desc;
+             const char* btn;  lv_color_t col; lv_event_cb_t cb; } cards[] = {
+        { LV_SYMBOL_EYE_OPEN, "Scan to Remove",   "Hold the item up\nto the camera",
+          "Scan",   COLOR_ACCENT2, toModeScanCb },
+        { LV_SYMBOL_LIST,     "Pick from Fridge", "Choose an item\nfrom your list",
+          "Choose", COLOR_ACCENT,  toModePickCb },
+    };
+
+    for (int i = 0; i < 2; i++) {
+        lv_obj_t* c = makeCard(scr_takeout_submode, sx + i * (cw + gap), cy, cw, ch);
+        lv_obj_set_style_border_color(c, cards[i].col, 0);
+
+        lv_obj_t* ic = makeLabel(c, cards[i].icon, &lv_font_montserrat_40, cards[i].col);
+        lv_obj_align(ic, LV_ALIGN_TOP_MID, 0, 12);
+
+        lv_obj_t* tt = makeLabel(c, cards[i].title, &lv_font_montserrat_20, COLOR_TEXT);
+        lv_obj_set_style_text_align(tt, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align_to(tt, ic, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
+
+        lv_obj_t* dd = makeLabel(c, cards[i].desc, &lv_font_montserrat_14, COLOR_SUBTEXT);
+        lv_obj_set_style_text_align(dd, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align_to(dd, tt, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+        lv_obj_t* bb = makeButton(c, cards[i].btn, cards[i].col, cards[i].cb);
+        lv_obj_set_size(bb, cw - 32, 42);
+        lv_obj_align(bb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    }
+
+    lv_obj_t* back = makeButton(scr_takeout_submode, LV_SYMBOL_LEFT " Back",
+                                lv_color_hex(0x333333), toSubmodeBackCb);
+    lv_obj_set_size(back, 130, 40);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_LEFT, 24, -18);
+}
+
+// Tapping a row selects that item for take-out (same downstream as a scan).
+static void toPickRowCb(lv_event_t* e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (int)gFridge.size()) return;
+    showTakeOutResult(gFridge[idx].name, -1.0f);   // conf<0 → manual selection
+}
+
+static void toPickBackCb(lv_event_t*) {
+    gUiState = UI_SUBMODE_SELECT;
+    switchScreen(scr_takeout_submode);
+}
+
+static void buildTakeOutPick() {
+    scr_takeout_pick = makeScreen();
+
+    lv_obj_t* header = lv_obj_create(scr_takeout_pick);
+    lv_obj_set_size(header, 800, 64); lv_obj_set_pos(header, 0, 0);
+    lv_obj_set_style_bg_color(header, COLOR_CARD, 0);
+    lv_obj_set_style_radius(header, 0, 0);
+    lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(header, COLOR_ACCENT2, 0);
+    lv_obj_set_style_border_width(header, 2, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t* ht = makeLabel(header, LV_SYMBOL_UPLOAD " Pick to Take Out",
+                              &lv_font_montserrat_22, COLOR_TEXT);
+    lv_obj_align(ht, LV_ALIGN_LEFT_MID, 20, 0);
+
+    lv_obj_t* hint = makeLabel(scr_takeout_pick, "Tap an item to remove it and get a recipe",
+                                &lv_font_montserrat_14, COLOR_SUBTEXT);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 74);
+
+    takeout_pick_list = lv_obj_create(scr_takeout_pick);
+    lv_obj_set_size(takeout_pick_list, 752, 340);
+    lv_obj_align(takeout_pick_list, LV_ALIGN_TOP_MID, 0, 100);
+    lv_obj_set_style_bg_color(takeout_pick_list, COLOR_BG, 0);
+    lv_obj_set_style_border_width(takeout_pick_list, 0, 0);
+    lv_obj_set_style_pad_all(takeout_pick_list, 4, 0);
+    lv_obj_set_style_pad_row(takeout_pick_list, 12, 0);
+    lv_obj_set_flex_flow(takeout_pick_list, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t* back = makeButton(scr_takeout_pick, LV_SYMBOL_LEFT " Back",
+                                lv_color_hex(0x333333), toPickBackCb);
+    lv_obj_set_size(back, 160, 44);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -10);
+}
+
+static void rebuildTakeOutPick() {
+    if (!scr_takeout_pick) buildTakeOutPick();
+    if (!takeout_pick_list) return;
+    lv_obj_clean(takeout_pick_list);
+
+    if (gFridge.empty()) {
+        lv_obj_t* empty = makeLabel(takeout_pick_list, "Your fridge is empty",
+                                     &lv_font_montserrat_18, COLOR_SUBTEXT);
+        lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+
+    int n = min((int)gFridge.size(), 40);
+    for (int i = 0; i < n; i++) {
+        lv_obj_t* row = lv_obj_create(takeout_pick_list);
+        lv_obj_set_size(row, 740, 56);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x1E1E1E), 0);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x2A2A2A), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(row, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, toPickRowCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+        lv_obj_t* dot = lv_obj_create(row);
+        lv_obj_set_size(dot, 8, 8);
+        lv_obj_set_style_bg_color(dot, COLOR_ACCENT2, 0);
+        lv_obj_set_style_radius(dot, 4, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_align(dot, LV_ALIGN_LEFT_MID, 12, 0);
+
+        lv_obj_t* lbl = makeLabel(row, gFridge[i].name.c_str(),
+                                   &lv_font_montserrat_18, COLOR_TEXT);
+        lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 30, 0);
+
+        lv_obj_t* arr = makeLabel(row, LV_SYMBOL_RIGHT, &lv_font_montserrat_16, COLOR_ACCENT2);
+        lv_obj_align(arr, LV_ALIGN_RIGHT_MID, -12, 0);
+    }
 }
 
 // ============================================================================
@@ -1199,7 +1426,13 @@ static void rcpItemToggleCb(lv_event_t* e) {
 
 static void rcpConfirmCb(lv_event_t*) {
     int added = 0;
-    for (auto& it : rcp_items) if (it.checked && it.name.length()) { inventoryAdd(it.name); added++; }
+    for (auto& it : rcp_items) {
+        if (!it.checked || !it.name.length()) continue;
+        // Store the canonical name when the backend recognized it; otherwise
+        // keep the descriptive receipt name. The checklist still shows `name`.
+        inventoryAdd(it.normalized.length() ? it.normalized : it.name);
+        added++;
+    }
     Serial.printf("[receipt] added %d items\n", added);
     gUiState = UI_ACTION_SELECT; switchScreen(scr_action);
 }
@@ -1250,6 +1483,7 @@ static void showReceiptResult(const String& json) {
     for (JsonObject it : doc["items"].as<JsonArray>()) {
         ReceiptItem r;
         r.name        = (const char*)(it["name"] | "");
+        r.normalized  = (const char*)(it["normalized_name"] | "");
         r.needs_refrig = it["needs_refrigeration"] | false;
         r.checked      = it["checked"] | r.needs_refrig;
         if (r.name.length()) rcp_items.push_back(r);
@@ -1294,6 +1528,47 @@ static void buildRecipePrompt() { scr_recipe_prompt = makeScreen(); }
 
 static void recDoneCb(lv_event_t*) { gUiState = UI_ACTION_SELECT; switchScreen(scr_action); }
 
+// Tap a "used from fridge" chip → remove the oldest matching item, then grey
+// out and disable the chip so it can't be removed twice.
+static void recUsedRemoveCb(lv_event_t* e) {
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (int)rec_used_items.size()) return;
+    bool ok = inventoryRemove(rec_used_items[idx]);
+    lv_obj_t* chip = (lv_obj_t*)lv_event_get_target(e);
+    lv_obj_set_style_bg_color(chip, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_color(chip, lv_color_hex(0x444444), 0);
+    lv_obj_add_state(chip, LV_STATE_DISABLED);
+    lv_obj_clear_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+    Serial.printf("[recipe] remove used '%s' -> %d\n",
+                  rec_used_items[idx].c_str(), (int)ok);
+}
+
+// Renders one chip: a label (+ optional trailing trash icon) in a rounded box.
+static void recAddChip(const char* text, lv_color_t border, bool removable, int idx) {
+    lv_obj_t* chip = lv_obj_create(rec_uses_obj);
+    lv_obj_set_size(chip, LV_SIZE_CONTENT, 34);
+    lv_obj_set_style_bg_color(chip, lv_color_hex(0x1E1E1E), 0);
+    lv_obj_set_style_border_color(chip, border, 0);
+    lv_obj_set_style_border_width(chip, 1, 0);
+    lv_obj_set_style_radius(chip, 16, 0);
+    lv_obj_set_style_pad_left(chip, 12, 0);
+    lv_obj_set_style_pad_right(chip, 12, 0);
+    lv_obj_set_style_pad_top(chip, 4, 0);
+    lv_obj_set_style_pad_bottom(chip, 4, 0);
+    lv_obj_clear_flag(chip, LV_OBJ_FLAG_SCROLLABLE);
+
+    String s = text;
+    if (removable) s += "  " LV_SYMBOL_TRASH;
+    lv_obj_t* lbl = makeLabel(chip, s.c_str(), &lv_font_montserrat_16,
+                              removable ? COLOR_TEXT : COLOR_SUBTEXT);
+    lv_obj_center(lbl);
+
+    if (removable) {
+        lv_obj_add_flag(chip, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(chip, recUsedRemoveCb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    }
+}
+
 static void buildRecipeResult() {
     scr_recipe_result = makeScreen();
     makeHeader(scr_recipe_result, "Recipe", "", COLOR_ACCENT2);
@@ -1305,7 +1580,7 @@ static void buildRecipeResult() {
     lv_obj_align(rec_time_lbl, LV_ALIGN_TOP_RIGHT, -24, 22);
 
     rec_steps_obj = lv_obj_create(scr_recipe_result);
-    lv_obj_set_size(rec_steps_obj, 752, 320);
+    lv_obj_set_size(rec_steps_obj, 752, 232);
     lv_obj_align(rec_steps_obj, LV_ALIGN_TOP_MID, 0, 80);
     lv_obj_set_style_bg_color(rec_steps_obj, COLOR_BG, 0);
     lv_obj_set_style_border_width(rec_steps_obj, 0, 0);
@@ -1313,14 +1588,30 @@ static void buildRecipeResult() {
     lv_obj_set_style_pad_row(rec_steps_obj, 10, 0);
     lv_obj_set_flex_flow(rec_steps_obj, LV_FLEX_FLOW_COLUMN);
 
+    // Caption + chip strip for used_fridge_items (removable) and missing_items.
+    rec_uses_cap = makeLabel(scr_recipe_result,
+        "Uses from fridge (tap " LV_SYMBOL_TRASH " to remove)   ·   Missing",
+        &lv_font_montserrat_14, COLOR_SUBTEXT);
+    lv_obj_align(rec_uses_cap, LV_ALIGN_TOP_LEFT, 24, 322);
+
+    rec_uses_obj = lv_obj_create(scr_recipe_result);
+    lv_obj_set_size(rec_uses_obj, 752, 70);
+    lv_obj_align(rec_uses_obj, LV_ALIGN_TOP_MID, 0, 344);
+    lv_obj_set_style_bg_color(rec_uses_obj, COLOR_BG, 0);
+    lv_obj_set_style_border_width(rec_uses_obj, 0, 0);
+    lv_obj_set_style_pad_all(rec_uses_obj, 2, 0);
+    lv_obj_set_style_pad_column(rec_uses_obj, 8, 0);
+    lv_obj_set_style_pad_row(rec_uses_obj, 6, 0);
+    lv_obj_set_flex_flow(rec_uses_obj, LV_FLEX_FLOW_ROW_WRAP);
+
     lv_obj_t* done = makeButton(scr_recipe_result, LV_SYMBOL_OK " Done",
                                  COLOR_ACCENT, recDoneCb);
-    lv_obj_set_size(done, 200, 50);
-    lv_obj_align(done, LV_ALIGN_BOTTOM_MID, 0, -16);
+    lv_obj_set_size(done, 200, 46);
+    lv_obj_align(done, LV_ALIGN_BOTTOM_MID, 0, -10);
 }
 
 static void showRecipeResult(const String& json) {
-    DynamicJsonDocument doc(8192);
+    DynamicJsonDocument doc(12288);   // steps + used_fridge_items + missing_items
     if (deserializeJson(doc, json)) return;
     String title = (const char*)(doc["title"] | "Recipe");
     int    tmin  = doc["time_min"] | 0;
@@ -1353,6 +1644,30 @@ static void showRecipeResult(const String& json) {
         lv_obj_set_width(tl, 650);
         lv_obj_align(tl, LV_ALIGN_LEFT_MID, 32, 0);
     }
+
+    // Used (removable) + missing (display-only) chips. used_fridge_items entries
+    // are removed from the fridge on tap (oldest dup first).
+    lv_obj_clean(rec_uses_obj);
+    rec_used_items.clear();
+    int chips = 0;
+    for (JsonVariant u : doc["used_fridge_items"].as<JsonArray>()) {
+        String name = (const char*)(u | "");
+        if (!name.length()) continue;
+        rec_used_items.push_back(name);
+        recAddChip(name.c_str(), COLOR_ACCENT, true, (int)rec_used_items.size() - 1);
+        chips++;
+    }
+    for (JsonVariant m : doc["missing_items"].as<JsonArray>()) {
+        String name = (const char*)(m | "");
+        if (!name.length()) continue;
+        recAddChip((LV_SYMBOL_WARNING " " + name).c_str(), COLOR_ACCENT2, false, -1);
+        chips++;
+    }
+    if (rec_uses_cap) {
+        if (chips) lv_obj_clear_flag(rec_uses_cap, LV_OBJ_FLAG_HIDDEN);
+        else       lv_obj_add_flag(rec_uses_cap, LV_OBJ_FLAG_HIDDEN);
+    }
+
     gUiState = UI_RECIPE_RESULT; switchScreen(scr_recipe_result);
 }
 
@@ -1383,7 +1698,7 @@ static void showMenuConfirmDelete(int idx) {
     lv_obj_clear_flag(menu_confirm_box, LV_OBJ_FLAG_SCROLLABLE);
 
     char msg[80];
-    snprintf(msg, sizeof(msg), "Remove \"%s\" from\nyour fridge?", gFridge[idx].c_str());
+    snprintf(msg, sizeof(msg), "Remove \"%s\" from\nyour fridge?", gFridge[idx].name.c_str());
     lv_obj_t* lbl = makeLabel(menu_confirm_box, msg, &lv_font_montserrat_18, COLOR_TEXT);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, 24);
@@ -1470,9 +1785,19 @@ static void rebuildMenu() {
         lv_obj_set_style_border_width(dot, 0, 0);
         lv_obj_align(dot, LV_ALIGN_LEFT_MID, 12, 0);
 
-        lv_obj_t* lbl = makeLabel(row, gFridge[i].c_str(),
+        lv_obj_t* lbl = makeLabel(row, gFridge[i].name.c_str(),
                                    &lv_font_montserrat_18, COLOR_TEXT);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 30, 0);
+
+        // Added-time (real clock, relayed from main). Blank until first sync.
+        if (gFridge[i].epoch > 0) {
+            time_t t = (time_t)gFridge[i].epoch;
+            struct tm* lt = localtime(&t);
+            char tb[24];
+            strftime(tb, sizeof(tb), "%b %e  %H:%M", lt);
+            lv_obj_t* tl = makeLabel(row, tb, &lv_font_montserrat_14, COLOR_SUBTEXT);
+            lv_obj_align(tl, LV_ALIGN_RIGHT_MID, -82, 0);
+        }
 
         // Separated trash button — clearly distinct from item content
         lv_obj_t* del = makeButton(row, LV_SYMBOL_TRASH, COLOR_DELETE, NULL);
@@ -1504,6 +1829,26 @@ static float jsonNumField(const String& json, const char* key) {
 static void onEvent(const String& json) {
     String evt = jsonStrField(json, "evt");
     if (evt == "ready") return;
+
+    if (evt == "time_sync") {
+        // Main relays UTC epoch (display has no clock/internet). Set our system
+        // clock + TZ so nowEpoch()/localtime() work for inventory timestamps.
+        // Parse as integer — a float can't hold a 10-digit epoch precisely.
+        uint32_t epoch = 0;
+        int ei = json.indexOf("\"epoch\":");
+        if (ei >= 0) epoch = (uint32_t)strtoul(json.c_str() + ei + 8, nullptr, 10);
+        if (epoch > 1700000000UL) {
+            struct timeval tv = { (time_t)epoch, 0 };
+            settimeofday(&tv, nullptr);
+            static bool tzSet = false;
+            if (!tzSet) {
+                setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);  // US Pacific
+                tzset();
+                tzSet = true;
+            }
+        }
+        return;
+    }
 
     if (evt == "proximity_wake") {
         if (gUiState == UI_IDLE) {
@@ -1584,6 +1929,7 @@ static void onEvent(const String& json) {
         int idx   = (int)jsonNumField(json, "idx");
         int total = (int)jsonNumField(json, "total");
         String name = jsonStrField(json, "name");
+        String norm = jsonStrField(json, "normalized_name");
         String pat  = "\"needs_refrigeration\":";
         int i = json.indexOf(pat);
         bool needs_refrig = false;
@@ -1598,6 +1944,7 @@ static void onEvent(const String& json) {
         lvgl_port_lock(-1);
         ReceiptItem r;
         r.name = name;
+        r.normalized = norm;
         r.needs_refrig = needs_refrig;
         r.checked = needs_refrig;
         rcp_items.push_back(r);
@@ -1699,6 +2046,8 @@ void setup() {
     buildRecipePrompt();
     buildRecipeResult();
     buildMenu();
+    buildTakeOutSubmode();
+    buildTakeOutPick();
     lv_scr_load(scr_idle);
     lvgl_port_unlock();
 

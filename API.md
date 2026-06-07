@@ -20,7 +20,10 @@
 |---|---|---|---|
 | GET | `/healthz` | 健康检查，连通性自检 | 否 |
 | POST | `/receipts/analyze` | 上传小票图片，返回结构化商品清单 | 是 |
-| POST | `/produce/recognize` | 上传果蔬图片，返回英文名称（非果蔬返回 `Uncertain`） | 是 |
+| POST | `/produce/recognize` | 上传果蔬图片（百度识别），返回英文名称（非果蔬返回 `Uncertain`） | 是 |
+| POST | `/produce/recognize-llm` | 同上，识别改用 Claude 视觉模型（更适配塑料模型/手持场景） | 是 |
+| POST | `/recipes/list` | 根据主料 + 冰箱清单，返回可做的菜名列表 | 是 |
+| POST | `/recipes/steps` | 根据选定菜品 + 冰箱清单，返回步骤、所用/缺少的食材 | 是 |
 
 ---
 
@@ -236,6 +239,166 @@ curl -X POST https://snapchef-production.up.railway.app/produce/recognize \
 | **502** | 百度识别调用失败，或 Claude 翻译失败 | 提示网络问题，可重试 1-2 次 |
 
 > 注意：与 `/receipts/analyze` 不同，本接口翻译失败会返回 **502**（没有合理的降级英文名），不会返回 200。
+
+---
+
+## 4. 果蔬识别（LLM 视觉）`POST /produce/recognize-llm`
+
+**与 `/produce/recognize` 请求和响应完全一致**，区别在于识别过程：不调用百度，而是把图片直接交给 Claude 视觉模型，由其一次完成"识别 + 英文命名"。
+
+使用场景已写入模型提示词：**一个人手持单个蔬菜/水果正对镜头**，模型只识别手中物体、忽略人脸/手/背景。**塑料果蔬模型也按真实果蔬识别**（塑料番茄 → `Tomato`），便于测试。
+
+### 何时用哪个
+
+| | `/produce/recognize`（百度） | `/produce/recognize-llm`（Claude） |
+|---|---|---|
+| 识别真实果蔬 | 准 | 准 |
+| 塑料模型 / 手持近距 / 构图差 | 容易判为 `Uncertain` | 更稳 |
+| 延迟 | 较低 | 略高（视觉推理）|
+| 成本 | 低 | 较高 |
+
+> 实测：手持塑料玉米的设备图，百度返回 `Uncertain`（最高分仅 0.37），LLM 返回 `Corn` (0.95)。**测试阶段建议用本接口。**
+
+### 请求
+
+与 `/produce/recognize` 相同（multipart 单字段 `image`，`image/jpeg` 或 `image/png`）。
+
+> 大小约束略有不同：原图 ≤ **8 MB**，且 base64 编码后 ≤ **5 MB**（Claude 单图上限，约原图 ≤ 3.75 MB）。
+
+**示例 curl**：
+```bash
+curl -X POST https://snapchef-production.up.railway.app/produce/recognize-llm \
+  -H "X-API-Key: <your-key>" \
+  -F "image=@corn.jpg;type=image/jpeg"
+```
+
+### 响应 `200 OK`
+
+字段与 `/produce/recognize` 完全相同；`raw_name` 在本接口恒为 `null`（无中文中间结果）。
+
+识别为果蔬：
+```json
+{ "name": "Corn", "raw_name": null, "confidence": 0.95 }
+```
+
+非果蔬 / 未识别：
+```json
+{ "name": "Uncertain", "raw_name": null, "confidence": null }
+```
+
+`confidence` 为模型自评置信度（0~1），仅供参考。`Uncertain` 由模型判定手持物不是果蔬时返回。
+
+> **受控词表**：`name` 取值被限定在后端维护的固定果蔬词表内（通过 tool schema 的 `enum` 强约束），保证输出规范、便于下游匹配——例如永远是 `Tomato`，不会出现 `tomatoes` / `Roma Tomato` 等变体。若手持物是果蔬但不在词表内，同样返回 `Uncertain`。需要新增可识别品类时，在后端 `app/schemas.py` 的 `PRODUCE_VOCAB` 里加一项即可。
+
+### 错误响应
+
+| HTTP | 触发条件 | 设备处理建议 |
+|---|---|---|
+| **400** | 文件类型不是 jpeg/png；文件为空；原图超 8MB；或编码后超 Claude 5MB 上限 | 提示用户重拍 / 压缩图像 |
+| **401** | `X-API-Key` 错误 | 致命错误，不应重试 |
+| **422** | `image` 字段缺失 | 固件 bug，检查字段名 |
+| **502** | Claude 视觉调用失败 | 提示网络问题，可重试 1-2 次 |
+
+---
+
+## 5. 推荐菜名 `POST /recipes/list`
+
+根据一个"主料"（`trigger`，用户想用的核心食材）和冰箱现有食材，返回若干可做的菜名。
+
+### 请求
+
+**Headers**：`X-API-Key`（必填）；`Content-Type: application/json`。
+
+**Body**（JSON）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `trigger` | string | ✅ | 核心食材 / 想做的方向，非空 |
+| `fridge` | string[] | 否 | 冰箱现有食材，默认 `[]` |
+
+```bash
+curl -X POST https://snapchef-production.up.railway.app/recipes/list \
+  -H "X-API-Key: <your-key>" -H "Content-Type: application/json" \
+  -d '{"trigger":"Tomato","fridge":["Tomato","Onion","Mozzarella","Egg"]}'
+```
+
+### 响应 `200 OK`
+
+```json
+{ "dishes": ["Caprese Salad", "Tomato Omelette", "Pasta Pomodoro"] }
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `dishes` | string[] | 3~6 个菜名，每个 ≤ 15 字符，均突出 `trigger`，优先使用冰箱食材 |
+
+> 菜名是后续 `/recipes/steps` 的入参 `dish`，原样回传即可。
+
+### 错误响应
+
+| HTTP | 触发条件 |
+|---|---|
+| **401** | `X-API-Key` 错误 |
+| **422** | `trigger` 缺失或为空 |
+| **502** | Claude 调用失败，或未生成任何菜名 |
+
+---
+
+## 6. 生成步骤 `POST /recipes/steps`
+
+根据选定菜品和冰箱清单，返回做菜步骤，并**额外告知用到了冰箱里的哪些食材、还缺哪些需要购买**。
+
+### 请求
+
+**Headers**：`X-API-Key`（必填）；`Content-Type: application/json`。
+
+**Body**（JSON）：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `dish` | string | ✅ | 菜名（通常取自 `/recipes/list` 的某一项），非空 |
+| `fridge` | string[] | 否 | 冰箱现有食材，默认 `[]`；用于判定 used / missing |
+
+```bash
+curl -X POST https://snapchef-production.up.railway.app/recipes/steps \
+  -H "X-API-Key: <your-key>" -H "Content-Type: application/json" \
+  -d '{"dish":"Tomato Egg Stir-fry","fridge":["Tomato","Egg","Scallion","Mozzarella"]}'
+```
+
+### 响应 `200 OK`
+
+```json
+{
+  "title": "Tomato Egg Stir-fry",
+  "time_min": 15,
+  "steps": [
+    "Cut the tomatoes into wedges and thinly slice the scallion.",
+    "Beat the eggs with a pinch of salt.",
+    "Scramble the eggs, then set aside.",
+    "Stir-fry the tomatoes until softened, return the eggs, toss together."
+  ],
+  "used_fridge_items": ["Tomato", "Egg", "Scallion"],
+  "missing_items": []
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `title` | string | 菜品规范名 |
+| `time_min` | int | 预计总耗时（分钟，整数）|
+| `steps` | string[] | 3~8 条有序操作步骤，每条一个动作 |
+| `used_fridge_items` | string[] | 这道菜**用到的、且确实在 `fridge` 里**的食材；回显 `fridge` 中的写法 |
+| `missing_items` | string[] | 菜谱需要但**冰箱没有、需购买**的食材；**不含**盐/油/糖/面粉等常备调料 |
+
+> **服务端会校对** `used_fridge_items` / `missing_items`：`used` 只保留与 `fridge` 大小写不敏感匹配的项，`missing` 会剔除其实已在 `fridge` 中的项，避免模型误报。两者都可能为空数组。
+
+### 错误响应
+
+| HTTP | 触发条件 |
+|---|---|
+| **401** | `X-API-Key` 错误 |
+| **422** | `dish` 缺失或为空 |
+| **502** | Claude 调用失败，或返回缺少 title/steps 等必要字段 |
 
 ---
 

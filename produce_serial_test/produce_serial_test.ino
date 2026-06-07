@@ -46,7 +46,6 @@
 
 #include <esp_now.h>
 #include <esp_wifi.h>
-#include <time.h>
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -62,7 +61,8 @@
 
 // --- WiFi (UW MPSK; same credentials as receipt_read.ino) ---
 static const char* WIFI_SSID = "UW MPSK";
-static const char* WIFI_PASS = "5gwXiwWSng3EXHq5";
+// static const char* WIFI_PASS = "5gwXiwWSng3EXHq5";
+static const char* WIFI_PASS = "45yVuUeU7At7gnxt";
 
 // --- Backend ---
 static const char* API_URL     = "https://snapchef-backend-production.up.railway.app/receipts/analyze";
@@ -169,7 +169,6 @@ static int   release_streak       = 0;
 static const uint8_t BROADCAST_MAC[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
 static uint8_t       gPeerMac[6]      = {0};
 static volatile bool gPeerLinked      = false;
-static volatile bool gPeerJustLinked  = false;   // set on HELLO, drained in loop()
 
 // --- Pending commands queue (filled in ESP-NOW recv callback, drained in loop()) ---
 static volatile bool gCmdPending = false;
@@ -812,6 +811,9 @@ static void espnowSendRaw(const uint8_t* mac, const uint8_t* buf, size_t len) {
 }
 
 static void sendEvent(const String& json) {
+    // SERIAL-TEST: always print the event so results are visible without a
+    // display peer attached.
+    Serial.printf("[evt] %s\n", json.c_str());
     if (!gPeerLinked) return;
     // Tag byte + JSON body. Events are kept short by design (well under the
     // 250 B ESP-NOW ceiling), so single-frame transmission is fine.
@@ -819,17 +821,6 @@ static void sendEvent(const String& json) {
     buf[0] = SNAPCHEF_MSG_EVT;
     memcpy(buf.data() + 1, json.c_str(), json.length());
     espnowSendRaw(gPeerMac, buf.data(), buf.size());
-    Serial.printf("[espnow:evt] %s\n", json.c_str());
-}
-
-// Relays the current wall-clock (UTC epoch) to the display, which has no clock
-// or internet of its own. No-op until NTP has set our clock. The display uses
-// this to stamp inventory add-times. Call from loop() (not the recv callback).
-static void sendTimeSync() {
-    time_t t = time(nullptr);
-    if (t < 1700000000) return;            // clock not synced yet (~2023-11)
-    if (!gPeerLinked) return;
-    sendEvent(String("{\"evt\":\"time_sync\",\"epoch\":") + String((uint32_t)t) + "}");
 }
 
 // Splits `payload` (raw text, typically JSON) into framed chunks of the form
@@ -875,7 +866,6 @@ static void onEspNowRecv(const esp_now_recv_info_t* info,
         memcpy(gPeerMac, mac, 6);
         addPeer(gPeerMac);
         gPeerLinked = true;
-        gPeerJustLinked = true;   // loop() will push a time_sync to the new peer
         Serial.printf("[espnow] peer linked %02X:%02X:%02X:%02X:%02X:%02X\n",
                       mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
         uint8_t ready = SNAPCHEF_MSG_READY;
@@ -1013,27 +1003,20 @@ static int sendReceiptTestStream(const String& resp, int maxItems) {
     for (int i = 0; i < total; i++) {
         String item   = resp.substring(starts[i], ends[i]);
         String name   = extractStringField(item, "name");
-        // Canonical produce name from the backend vocab; empty for non-produce
-        // or unrecognized items. The display stores this in inventory when set.
-        String norm   = extractStringField(item, "normalized_name");
         String refrig = extractBoolField(item, "needs_refrigeration");
-        auto jsonEscape = [](const String& in) {
-            String out; out.reserve(in.length() + 4);
-            for (size_t k = 0; k < in.length(); k++) {
-                char ch = in[k];
-                if (ch == '"' || ch == '\\') out += '\\';
-                out += ch;
-            }
-            return out;
-        };
+        String safeName;
+        safeName.reserve(name.length() + 4);
+        for (size_t k = 0; k < name.length(); k++) {
+            char ch = name[k];
+            if (ch == '"' || ch == '\\') safeName += '\\';
+            safeName += ch;
+        }
         String j = "{\"evt\":\"receipt_item\",\"idx\":";
         j += String(i);
         j += ",\"total\":";
         j += String(total);
         j += ",\"name\":\"";
-        j += jsonEscape(name);
-        j += "\",\"normalized_name\":\"";
-        j += jsonEscape(norm);
+        j += safeName;
         j += "\",\"needs_refrigeration\":";
         j += refrig;
         j += "}";
@@ -1305,37 +1288,37 @@ void setup() {
 
     connectWiFi();
     if (WiFi.status() == WL_CONNECTED) {
-        // NTP (UTC) so we can relay wall-clock time to the clock-less display.
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         healthzSelfCheck();
         initDebugServer();
     }
 
     initEspNow();
     Serial.println("ready");
+    Serial.println(">>> SERIAL-TEST build: type 'o' + Enter to run one recognition <<<");
 }
 
 void loop() {
     // 0. Service the debug preview HTTP server.
     if (WiFi.status() == WL_CONNECTED) gDebugServer.handleClient();
 
+    // SERIAL-TEST: type 'o' (+ Enter) in the serial monitor to trigger one
+    // recognition pass — local TFLM first, then the LLM cloud fallback if it
+    // doesn't lock within VEGGIE_LOCAL_TIMEOUT_MS. Same pipeline as production;
+    // only the trigger differs (normally an ESP-NOW start_veggie_scan command).
+    while (Serial.available() > 0) {
+        char ch = (char)Serial.read();
+        if ((ch == 'o' || ch == 'O') && gState == STATE_IDLE) {
+            Serial.println("[serial-test] 'o' received — starting recognition");
+            gPendingPurpose = "in";
+            runVeggieScan();
+        }
+    }
+
     // 1. Pull pending command (filled by the ESP-NOW recv callback).
     if (gCmdPending) {
         String c = gPendingCmd;
         gCmdPending = false;
         handleCmd(c);
-    }
-
-    // 1b. Relay wall-clock to the display: right after a peer links, then
-    // periodically so its drift-free clock stays close to ours.
-    static unsigned long lastTimeSync = 0;
-    if (gPeerJustLinked) {
-        gPeerJustLinked = false;
-        sendTimeSync();
-        lastTimeSync = millis();
-    } else if (gState == STATE_IDLE && millis() - lastTimeSync > 600000UL) {
-        lastTimeSync = millis();
-        sendTimeSync();
     }
 
     // 2. HC-SR04 proximity wake (only when idle and a peer is connected).
