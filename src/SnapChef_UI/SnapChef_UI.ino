@@ -159,6 +159,11 @@ static uint8_t       gMainMac[6]      = {0};
 static volatile bool peerLinked       = false;
 static unsigned long gLastHelloMs     = 0;
 static int           gEspNowChannel   = SNAPCHEF_ESPNOW_CHANNEL_FALLBACK;
+// Discovery channel-hop set: main is a Wi-Fi STA whose channel is dictated by
+// whichever "UW MPSK" AP it joins (1/6/11), so we probe each until linked.
+static uint8_t gHopChans[5];
+static int     gHopCount   = 0;
+static int     gChanHopIdx = 0;
 
 static String dataAccum;
 static int    dataExpectedSeq   = 1;
@@ -256,8 +261,8 @@ static void onEspNowRecv(const esp_now_recv_info_t* info,
     if (tag == SNAPCHEF_MSG_DATA) { handleDataFrame(p, pl); return; }
 }
 
-// Scans the air for the AP main joins so we can lock our radio to the same
-// channel as main's ESP-NOW socket. Returns -1 if the SSID isn't visible.
+// Scans the air for an AP with main's SSID, to seed the hop list with the most
+// likely channel first. Returns -1 if the SSID isn't visible.
 static int findMainChannel() {
     int n = WiFi.scanNetworks(false, false, false, 300, 0);
     int ch = -1;
@@ -268,24 +273,41 @@ static int findMainChannel() {
     return ch;
 }
 
+// Builds the channels to probe: the scan hint first (fast convergence), then the
+// three non-overlapping 2.4 GHz channels enterprise SSIDs like "UW MPSK" use.
+static void buildHopList(int hint) {
+    const uint8_t base[] = {1, 6, 11};
+    gHopCount = 0;
+    auto add = [&](uint8_t c) {
+        for (int i = 0; i < gHopCount; i++) if (gHopChans[i] == c) return;
+        if (gHopCount < (int)sizeof(gHopChans)) gHopChans[gHopCount++] = c;
+    };
+    if (hint >= 1 && hint <= 13) add((uint8_t)hint);
+    for (uint8_t c : base) add(c);
+}
+
 static void espnowInit() {
-    // Display never associates with the AP, but we need STA mode so ESP-NOW
-    // has a radio interface to bind to. The channel must be set explicitly
-    // because there's no AP connection to fix it for us.
+    // Display never associates with the AP, but we need STA mode so ESP-NOW has
+    // a radio interface to bind to. With no AP to fix our channel, we probe.
     WiFi.mode(WIFI_STA);
     delay(50);
 
-    int ch = findMainChannel();
-    if (ch < 1) ch = SNAPCHEF_ESPNOW_CHANNEL_FALLBACK;
-    gEspNowChannel = ch;
-    esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("[espnow] channel=%d\n", ch);
+    int hint = findMainChannel();
+    buildHopList(hint);
+    gChanHopIdx = 0;
+    gEspNowChannel = gHopChans[0];
+    esp_wifi_set_channel(gEspNowChannel, WIFI_SECOND_CHAN_NONE);
+    Serial.printf("[espnow] hop set =");
+    for (int i = 0; i < gHopCount; i++) Serial.printf(" %d", gHopChans[i]);
+    Serial.printf("  (scan hint=%d)\n", hint);
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("[espnow] init failed"); return;
     }
     esp_now_register_recv_cb(onEspNowRecv);
-    addPeer(BROADCAST_MAC, ch);
+    // channel 0 = transmit on whatever channel the radio is currently on, so
+    // HELLO broadcasts follow our hop without re-adding the peer each time.
+    addPeer(BROADCAST_MAC, 0);
 
     uint8_t mac[6]; WiFi.macAddress(mac);
     Serial.printf("[espnow] ready, mac=%02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -296,6 +318,12 @@ static void espnowTick() {
     if (peerLinked) return;
     if (millis() - gLastHelloMs < 500) return;
     gLastHelloMs = millis();
+    // Hop to the next candidate channel, then probe. Whatever channel main's AP
+    // put it on, we land on it within a couple of seconds and lock there when
+    // READY comes back (see onEspNowRecv → addPeer with gEspNowChannel).
+    gEspNowChannel = gHopChans[gChanHopIdx];
+    gChanHopIdx = (gChanHopIdx + 1) % gHopCount;
+    esp_wifi_set_channel(gEspNowChannel, WIFI_SECOND_CHAN_NONE);
     uint8_t hello = SNAPCHEF_MSG_HELLO;
     espnowSendRaw(BROADCAST_MAC, &hello, 1);
 }

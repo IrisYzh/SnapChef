@@ -446,6 +446,27 @@ static bool connectWiFi() {
     return true;
 }
 
+// We share one radio with the Wi-Fi STA, so while associated the channel is
+// dictated by the AP (often not the display's). The display sits on ONE channel
+// chosen at its boot — we don't know which — so main scans these candidates
+// (in loop(), while unlinked) and LOCKS to whichever one the display's HELLO
+// arrives on (see onEspNowRecv). No guessing. parkEspnow() then keeps the radio
+// on that locked channel between transient Wi-Fi calls. Trade-off: no always-on
+// Wi-Fi (the debug preview server is only reachable mid-upload).
+static const uint8_t kEspnowHopChans[] = {1, 6, 11};
+static int  gEspnowChannel = 11;     // locked channel once the display is found
+static int  gCurChan       = 11;     // channel the radio is on right now
+static int  gHopIdx        = 0;
+static unsigned long gLastHopMs = 0;
+
+static void parkEspnow() {
+    WiFi.disconnect(false);        // deassociate but keep STA up for ESP-NOW
+    delay(30);
+    esp_wifi_set_channel(gEspnowChannel, WIFI_SECOND_CHAN_NONE);
+    gCurChan = gEspnowChannel;
+    Serial.printf("[espnow] parked on channel %d\n", gEspnowChannel);
+}
+
 // ============================================================================
 //                       DEBUG: receipt preview HTTP server
 // ============================================================================
@@ -723,6 +744,7 @@ static void runRecipeList() {
             dishes = "Stir-Fried Medley|Quick Soup|Veggie Wrap";
     }
 
+    parkEspnow();   // back to the display's channel before ESP-NOW sends
     String payload = "{\"evt\":\"recipe_list\",\"dishes\":\"";
     payload += dishes;
     payload += "\"}";
@@ -767,6 +789,7 @@ static void runRecipeSteps() {
         payload = buildRecipeMock(gPendingIngredientsJson);
     }
 
+    parkEspnow();   // back to the display's channel before ESP-NOW sends
     sendEvent("{\"evt\":\"recipe_result\"}");
     sendData(payload);
     gState = STATE_IDLE;
@@ -871,13 +894,15 @@ static void onEspNowRecv(const esp_now_recv_info_t* info,
     const uint8_t* mac = info->src_addr;
 
     if (tag == SNAPCHEF_MSG_HELLO) {
-        // Display has appeared. Bind it as our unicast peer and ACK with READY.
+        // Display has appeared on the channel we're currently scanning — lock
+        // to it, bind it as our unicast peer, and ACK with READY.
         memcpy(gPeerMac, mac, 6);
         addPeer(gPeerMac);
         gPeerLinked = true;
         gPeerJustLinked = true;   // loop() will push a time_sync to the new peer
-        Serial.printf("[espnow] peer linked %02X:%02X:%02X:%02X:%02X:%02X\n",
-                      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+        gEspnowChannel = gCurChan;
+        Serial.printf("[espnow] peer linked %02X:%02X:%02X:%02X:%02X:%02X on channel %d\n",
+                      mac[0],mac[1],mac[2],mac[3],mac[4],mac[5], gCurChan);
         uint8_t ready = SNAPCHEF_MSG_READY;
         espnowSendRaw(gPeerMac, &ready, 1);
         return;
@@ -892,6 +917,7 @@ static void onEspNowRecv(const esp_now_recv_info_t* info,
             memcpy(gPeerMac, mac, 6);
             addPeer(gPeerMac);
             gPeerLinked = true;
+            gEspnowChannel = gCurChan;
         }
         // Cancel is handled inline; everything else queued for the main loop.
         if (s.indexOf("\"cancel\"") >= 0) {
@@ -1079,6 +1105,7 @@ static bool runCloudProduceFallback(const String& purpose) {
     String errCode, errMsg;
     String resp = uploadProduce(jbuf, jlen, errCode, errMsg);
     heap_caps_free(jbuf);
+    parkEspnow();   // back to the display's channel before any ESP-NOW send
 
     // Heavy WiFi/TLS just finished; let the radio settle before the next
     // ESP-NOW frame (sent by us on success, or by the caller's veggie_unknown
@@ -1213,6 +1240,7 @@ static void runReceiptCapture() {
     String errCode, errMsg;
     String resp = uploadReceipt(jbuf, jlen, errCode, errMsg);
     heap_caps_free(jbuf);
+    parkEspnow();   // back to the display's channel before any ESP-NOW send
 
     if (resp.length() == 0) {
         String j = "{\"evt\":\"receipt_error\",\"code\":\"";
@@ -1309,15 +1337,34 @@ void setup() {
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         healthzSelfCheck();
         initDebugServer();
+        // Wait briefly for NTP so the first inventory items get a real time.
+        for (int i = 0; i < 20 && time(nullptr) < 1700000000; i++) delay(250);
+        Serial.printf("[time] epoch=%ld\n", (long)time(nullptr));
     }
 
     initEspNow();
+    // Release the AP association and start sweeping channels for the display;
+    // loop() hops until its HELLO arrives, then we lock (see onEspNowRecv).
+    WiFi.disconnect(false);
+    delay(30);
+    gCurChan = kEspnowHopChans[0];
+    esp_wifi_set_channel(gCurChan, WIFI_SECOND_CHAN_NONE);
+    Serial.println("[espnow] scanning channels 1/6/11 for the display...");
     Serial.println("ready");
 }
 
 void loop() {
     // 0. Service the debug preview HTTP server.
     if (WiFi.status() == WL_CONNECTED) gDebugServer.handleClient();
+
+    // 0b. Until the display links, sweep ESP-NOW channels to find whichever one
+    // it chose at boot. Stops automatically once linked (gPeerLinked).
+    if (!gPeerLinked && millis() - gLastHopMs > 400) {
+        gLastHopMs = millis();
+        gCurChan = kEspnowHopChans[gHopIdx];
+        gHopIdx = (gHopIdx + 1) % (sizeof(kEspnowHopChans) / sizeof(kEspnowHopChans[0]));
+        esp_wifi_set_channel(gCurChan, WIFI_SECOND_CHAN_NONE);
+    }
 
     // 1. Pull pending command (filled by the ESP-NOW recv callback).
     if (gCmdPending) {
